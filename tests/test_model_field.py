@@ -100,6 +100,36 @@ class ModelPlaceholderTests(unittest.TestCase):
         )
         self.assertEqual("openrouter/z-ai/glm-5.2", engines["harness"].model_default)
 
+    def test_load_engines_reads_runtime_hardening_fields(self) -> None:
+        engines = load_engines(
+            {
+                "harness": {
+                    "bin": "/usr/bin/env",
+                    "args_template": ["opencode", "run", "{spec}"],
+                    "env_allowlist": ["PATH", "OPENROUTER_BASE_URL"],
+                    "preflight_executables": ["opencode"],
+                }
+            }
+        )
+        self.assertEqual(
+            ("PATH", "OPENROUTER_BASE_URL"),
+            engines["harness"].env_allowlist,
+        )
+        self.assertEqual(("opencode",), engines["harness"].preflight_executables)
+
+    def test_codex_override_inherits_secure_runtime_defaults(self) -> None:
+        default = load_engines(None)["codex"]
+        overridden = load_engines(
+            {"codex": {"token_regex": "tokens: ([0-9]+)"}}
+        )["codex"]
+        self.assertEqual(default.env_allowlist, overridden.env_allowlist)
+        self.assertEqual(
+            default.preflight_executables,
+            overridden.preflight_executables,
+        )
+        self.assertIn("HOME", overridden.env_allowlist)
+        self.assertNotIn("OPENAI_API_KEY", overridden.env_allowlist)
+
 
 class ModelValidationTests(unittest.TestCase):
     def config(self, engines: dict[str, EngineConfig]) -> AppConfig:
@@ -202,6 +232,40 @@ class ModelValidationTests(unittest.TestCase):
         config = self.config({"worker": absolute, "shellworker": bare})
         preflight_engine_bins(self.manifest(self.base_task(engine="worker")), config)
         preflight_engine_bins(self.manifest(self.base_task(engine="shellworker")), config)
+
+    def test_preflight_checks_real_binary_behind_env_launcher(self) -> None:
+        wrapped = EngineConfig(
+            name="wrapped",
+            bin="/usr/bin/env",
+            args_template=("ringer-definitely-missing-worker", "{spec}"),
+            full_access_args=(),
+            sandbox_args=(),
+            token_regex=None,
+            env_allowlist=("PATH",),
+            preflight_executables=("ringer-definitely-missing-worker",),
+        )
+        config = self.config({"wrapped": wrapped})
+        manifest = self.manifest(self.base_task(engine="wrapped"))
+        with self.assertRaisesRegex(
+            ValueError,
+            "preflight executable not found.*ringer-definitely-missing-worker",
+        ):
+            preflight_engine_bins(manifest, config)
+
+    def test_preflight_rejects_env_launcher_without_real_binary_declaration(self) -> None:
+        undeclared = EngineConfig(
+            name="wrapped",
+            bin="/usr/bin/env",
+            args_template=("python3", "{spec}"),
+            full_access_args=(),
+            sandbox_args=(),
+            token_regex=None,
+            env_allowlist=("PATH",),
+        )
+        config = self.config({"wrapped": undeclared})
+        manifest = self.manifest(self.base_task(engine="wrapped"))
+        with self.assertRaisesRegex(ValueError, "must declare.*preflight_executables"):
+            preflight_engine_bins(manifest, config)
 
 
 if __name__ == "__main__":

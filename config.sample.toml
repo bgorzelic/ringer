@@ -39,6 +39,30 @@ jsonl_path = "~/.ringer/runs.jsonl"
 # here only for machine-specific installs.
 bin = "codex"
 
+# Ringer copies only these named variables into the worker process. Keep this
+# list minimal: add a non-secret routing variable only when the CLI requires
+# it, and never add credential or token variables. Environment values are not
+# written to Ringer logs or state.
+env_allowlist = [
+  "CODEX_HOME",
+  "COLORTERM",
+  "HOME",
+  "LANG",
+  "LC_ALL",
+  "LC_CTYPE",
+  "NO_COLOR",
+  "PATH",
+  "TERM",
+  "TMPDIR",
+  "XDG_CACHE_HOME",
+  "XDG_CONFIG_HOME",
+  "XDG_DATA_HOME",
+]
+
+# Every real CLI behind a launcher or wrapper must be declared here. Ringer
+# validates both `bin` and each declaration before starting any task slot.
+preflight_executables = ["codex"]
+
 # Placeholders:
 # - {taskdir}: task working directory
 # - {spec}: task prompt/spec
@@ -76,6 +100,8 @@ token_regex = "tokens\\s+used\\s*:?\\s*([0-9][0-9,]*)"
 # Uncomment to enable.
 # [engines.grok]
 # bin = "grok"
+# env_allowlist = ["HOME", "PATH", "TMPDIR", "XDG_CONFIG_HOME"]
+# preflight_executables = ["grok"]
 # model_default = "grok-composer-2.5-fast"
 # args_template = [
 #   "--cwd",
@@ -100,6 +126,8 @@ token_regex = "tokens\\s+used\\s*:?\\s*([0-9][0-9,]*)"
 # For CI, acceptance evals, and trying Ringer without an API bill.
 # [engines.mock]
 # bin = "python3"
+# env_allowlist = ["PATH"]
+# preflight_executables = ["python3"]
 # args_template = [
 #   "/absolute/path/to/ringer/engines/mock_worker.py",
 #   "{spec}",
@@ -122,6 +150,8 @@ token_regex = "tokens\\s+used\\s*:?\\s*([0-9][0-9,]*)"
 # Uncomment and set an absolute path for `bin` to enable.
 # [engines.opencode]
 # bin = "/absolute/path/to/ringer/engines/opencode-sandboxed.sh"
+# env_allowlist = ["HOME", "PATH", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME"]
+# preflight_executables = ["opencode"]
 # model_default = "openrouter/z-ai/glm-5.2"
 # args_template = [
 #   "{taskdir}",

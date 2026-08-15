@@ -40,7 +40,7 @@ from html import escape as html_escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 
 TOOL_NAME = "ringer"
@@ -58,6 +58,21 @@ DEFAULT_CATALOG_SOURCE = "https://openrouter.ai/api/v1/models"
 CATALOG_AUTO_REFRESH_MAX_AGE_S = 24 * 60 * 60
 CATALOG_FETCH_TIMEOUT_S = 5
 DEFAULT_TOKEN_REGEX = r"tokens\s+used\s*:?\s*([0-9][0-9,]*)"
+CODEX_ENV_ALLOWLIST = (
+    "CODEX_HOME",
+    "COLORTERM",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "LC_CTYPE",
+    "NO_COLOR",
+    "PATH",
+    "TERM",
+    "TMPDIR",
+    "XDG_CACHE_HOME",
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+)
 ACTIVITY_TAIL_BYTES = 2048
 ACTIVITY_TEXT_LIMIT = 80
 ARTIFACT_WRAPPER_TAIL_BYTES = 256 * 1024
@@ -112,6 +127,13 @@ class EngineConfig:
     # its own "model" — this is what makes a harness engine (OpenCode) model
     # agnostic instead of hard-coding one model into the command line.
     model_default: str = ""
+    # Only named variables are copied from Ringer's environment into workers.
+    # Values are runtime-only and must never be included in logs or state.
+    env_allowlist: tuple[str, ...] = ()
+    # Additional real executables to validate before any task starts. This is
+    # required for launchers such as /usr/bin/env whose own existence does not
+    # prove that the worker CLI behind them is installed.
+    preflight_executables: tuple[str, ...] = ()
 
     @property
     def process_name(self) -> str:
@@ -271,6 +293,22 @@ def as_string_tuple(value: Any, *, key: str) -> tuple[str, ...]:
     return tuple(str(item) for item in value)
 
 
+def as_nonempty_string_tuple(value: Any, *, key: str) -> tuple[str, ...]:
+    items = as_string_tuple(value, key=key)
+    cleaned = tuple(item.strip() for item in items)
+    if any(not item for item in cleaned):
+        raise ValueError(f"{key} entries must not be empty")
+    return cleaned
+
+
+def as_env_allowlist(value: Any, *, key: str) -> tuple[str, ...]:
+    names = as_nonempty_string_tuple(value, key=key)
+    for name in names:
+        if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) is None:
+            raise ValueError(f"{key} contains invalid environment variable name: {name}")
+    return tuple(dict.fromkeys(names))
+
+
 def built_in_codex_engine() -> EngineConfig:
     resolved = shutil.which(DEFAULT_ENGINE_NAME) or DEFAULT_ENGINE_NAME
     return EngineConfig(
@@ -288,6 +326,8 @@ def built_in_codex_engine() -> EngineConfig:
         full_access_args=("--dangerously-bypass-approvals-and-sandbox",),
         sandbox_args=("--sandbox", "workspace-write"),
         token_regex=DEFAULT_TOKEN_REGEX,
+        env_allowlist=CODEX_ENV_ALLOWLIST,
+        preflight_executables=(resolved,),
     )
 
 
@@ -368,6 +408,17 @@ def load_engines(raw: Any) -> dict[str, EngineConfig]:
         model_default = str(
             section.get("model_default", base.model_default if base else "")
         ).strip()
+        env_allowlist = as_env_allowlist(
+            section.get("env_allowlist", list(base.env_allowlist) if base else []),
+            key=f"engines.{clean_name}.env_allowlist",
+        )
+        preflight_executables = as_nonempty_string_tuple(
+            section.get(
+                "preflight_executables",
+                list(base.preflight_executables) if base else [],
+            ),
+            key=f"engines.{clean_name}.preflight_executables",
+        )
         engines[clean_name] = EngineConfig(
             name=clean_name,
             bin=bin_path,
@@ -376,6 +427,8 @@ def load_engines(raw: Any) -> dict[str, EngineConfig]:
             sandbox_args=sandbox_args,
             token_regex=token_regex,
             model_default=model_default,
+            env_allowlist=env_allowlist,
+            preflight_executables=preflight_executables,
         )
     return engines
 
@@ -7112,6 +7165,7 @@ class RingerRunner:
                 proc = await asyncio.create_subprocess_exec(
                     *cmd,
                     cwd=str(runtime.taskdir),
+                    env=build_worker_environment(engine),
                     stdin=asyncio.subprocess.DEVNULL,
                     stdout=asyncio.subprocess.PIPE,
                     stderr=asyncio.subprocess.STDOUT,
@@ -7403,6 +7457,15 @@ def build_worker_command(
     return command
 
 
+def build_worker_environment(
+    engine: EngineConfig,
+    parent_environment: Mapping[str, str] | None = None,
+) -> dict[str, str]:
+    """Return the worker's fail-closed environment without logging values."""
+    parent = os.environ if parent_environment is None else parent_environment
+    return {name: parent[name] for name in engine.env_allowlist if name in parent}
+
+
 ENGINE_INSTALL_HINTS = {
     "codex": "install it with `npm install -g @openai/codex` (or `brew install --cask codex`), then run `codex login`",
     "opencode": "install it with `curl -fsSL https://opencode.ai/install | bash`, then run `opencode auth login`",
@@ -7420,17 +7483,35 @@ def preflight_engine_bins(manifest: Manifest, config: AppConfig) -> None:
         engine = config.engines.get(name)
         if engine is None:
             continue  # validate_manifest_engines already rejected this
-        bin_path = engine.bin
-        if os.sep in bin_path:
-            found = Path(bin_path).expanduser()
-            missing = not (found.is_file() and os.access(found, os.X_OK))
-        else:
-            missing = shutil.which(bin_path) is None
-        if missing:
-            hint = ENGINE_INSTALL_HINTS.get(name, f"install it or fix engines.{name}.bin in config.toml")
+        if Path(engine.bin).name == "env" and not engine.preflight_executables:
             raise ValueError(
-                f"engine '{name}' binary not found ({bin_path}) — {hint}"
+                f"engine '{name}' uses {engine.bin} and must declare "
+                f"engines.{name}.preflight_executables"
             )
+        worker_environment = build_worker_environment(engine)
+        search_path = worker_environment.get("PATH", os.defpath)
+        declarations = (("binary", engine.bin),) + tuple(
+            ("preflight executable", executable)
+            for executable in engine.preflight_executables
+        )
+        checked: set[str] = set()
+        for declaration, executable in declarations:
+            if executable in checked:
+                continue
+            checked.add(executable)
+            if os.sep in executable:
+                found = Path(executable).expanduser()
+                missing = not (found.is_file() and os.access(found, os.X_OK))
+            else:
+                missing = shutil.which(executable, path=search_path) is None
+            if missing:
+                hint = ENGINE_INSTALL_HINTS.get(
+                    name,
+                    f"install it or fix engines.{name}.{('bin' if declaration == 'binary' else 'preflight_executables')} in config.toml",
+                )
+                raise ValueError(
+                    f"engine '{name}' {declaration} not found ({executable}) — {hint}"
+                )
 
 
 def validate_manifest_engines(manifest: Manifest, config: AppConfig) -> None:
@@ -8026,6 +8107,7 @@ async def run_manifest(
     dashboard_enabled: bool,
     force_browser: bool,
 ) -> int:
+    preflight_engine_bins(manifest, config)
     runner = RingerRunner(
         manifest,
         config=config,

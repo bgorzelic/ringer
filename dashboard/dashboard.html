@@ -319,6 +319,10 @@
       border-color: rgba(255,255,255,.18);
       background: rgba(255,255,255,.055);
     }
+    .task:focus-visible {
+      outline: 2px solid var(--accent);
+      outline-offset: 2px;
+    }
     .task.running, .task.retrying { border-left-color: var(--accent); }
     .task.verifying { border-left-color: var(--amber); }
     .task.pass { border-left-color: var(--green); }
@@ -345,6 +349,7 @@
     .task.verifying .task-status { background: var(--amber); }
     .task.pass .task-status { background: var(--green); }
     .task.fail .task-status { background: var(--red); }
+    .task.retried .task-status { box-shadow: inset 0 0 0 2px var(--amber); }
     .task-activity, .task-meta {
       grid-column: 1 / -1;
       min-width: 0;
@@ -376,6 +381,27 @@
     .children {
       color: #b9f3ff;
       font-weight: 800;
+    }
+    .task-retry {
+      color: var(--amber);
+      font-weight: 800;
+    }
+    .task-access {
+      color: var(--muted);
+    }
+    .task-blocked-badge {
+      color: var(--red);
+      font-weight: 800;
+    }
+    .run-access {
+      min-width: 0;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 10.5px;
+      font-weight: 700;
     }
     .task-drawer {
       grid-column: 1 / -1;
@@ -429,6 +455,15 @@
       text-decoration: none;
     }
     .drawer-links a:hover { text-decoration: underline; }
+    .drawer-blocked {
+      border: 1px solid rgba(255,84,104,.42);
+      border-radius: 6px;
+      padding: 6px 8px;
+      background: rgba(255,84,104,.10);
+      color: #ffcdd4;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 10.5px;
+    }
     .worker-stream {
       width: 100%;
       min-height: 180px;
@@ -1124,12 +1159,38 @@
       return Number.isFinite(number) ? number : 0;
     }
 
+    function isUnknownAmount(value) {
+      return value === null || value === undefined || value === "";
+    }
+
     function plural(count, singular, pluralName) {
       return `${count} ${count === 1 ? singular : pluralName}`;
     }
 
-    function formatTokens(value) {
+    function formatTokens(value, unknown) {
+      if (unknown) return "tok unknown";
       return `${numberOrZero(value).toLocaleString()} tok`;
+    }
+
+    function formatCount(value, unknown) {
+      return unknown ? "unknown" : String(numberOrZero(value));
+    }
+
+    // Optional forward-compatible metadata: absent means "not reported yet" (render
+    // nothing to preserve today's layout); present-but-empty still needs a label so it
+    // never silently reads as verified/authenticated access.
+    function optionalMetaLabel(raw) {
+      if (raw === undefined) return null;
+      const text = String(raw ?? "").trim();
+      return text || "unknown";
+    }
+
+    function accessLabel(source) {
+      return optionalMetaLabel(source?.access_class !== undefined ? source.access_class : source?.access);
+    }
+
+    function blockedReasonLabel(task) {
+      return optionalMetaLabel(task?.blocked_reason);
     }
 
     function fmtElapsed(seconds) {
@@ -1169,9 +1230,12 @@
         const totals = run.totals || {};
         const summary = run.summary || {};
         const state = run.state || (run.finished ? "finished" : "live");
-        const pass = numberOrZero(run.pass ?? summary.pass ?? totals.pass ?? 0);
-        const fail = numberOrZero(run.fail ?? summary.fail ?? totals.fail ?? 0);
-        const tokens = numberOrZero(run.tokens ?? summary.tokens ?? totals.tokens ?? 0);
+        const rawPass = run.pass ?? summary.pass ?? totals.pass;
+        const rawFail = run.fail ?? summary.fail ?? totals.fail;
+        const rawTokens = run.tokens ?? summary.tokens ?? totals.tokens;
+        const pass = numberOrZero(rawPass);
+        const fail = numberOrZero(rawFail);
+        const tokens = numberOrZero(rawTokens);
         return {
           ...run,
           state,
@@ -1182,6 +1246,9 @@
           pass,
           fail,
           tokens,
+          passUnknown: isUnknownAmount(rawPass),
+          failUnknown: isUnknownAmount(rawFail),
+          tokensUnknown: isUnknownAmount(rawTokens),
           tasks: Array.isArray(run.tasks) ? run.tasks : []
         };
       }).sort((left, right) => {
@@ -1455,6 +1522,10 @@
       const identity = document.createElement("span");
       identity.className = "identity";
 
+      const access = document.createElement("span");
+      access.className = "run-access";
+      access.hidden = true;
+
       const meta = document.createElement("div");
       meta.className = "run-meta";
 
@@ -1474,7 +1545,7 @@
       drawer.className = "task-drawer";
       drawer.hidden = true;
 
-      main.append(name, identity);
+      main.append(name, identity, access);
       meta.append(elapsed, tokens, final);
       head.append(dot, main, meta);
       node.append(head, tasks);
@@ -1484,7 +1555,7 @@
         node,
         run: null,
         tasks: new Map(),
-        elements: {dot, name, identity, elapsed, tokens, final, tasks, drawer}
+        elements: {dot, name, identity, access, elapsed, tokens, final, tasks, drawer}
       };
     }
 
@@ -1492,6 +1563,11 @@
       const node = document.createElement("div");
       node.className = "task";
       node.setAttribute("data-task-key", key);
+      if (key !== "__empty__") {
+        node.setAttribute("role", "button");
+        node.tabIndex = 0;
+        node.setAttribute("aria-expanded", "false");
+      }
 
       const name = document.createElement("div");
       name.className = "task-key";
@@ -1514,7 +1590,18 @@
       const children = document.createElement("div");
       children.className = "children";
 
-      meta.append(elapsed, tokens, children);
+      const retry = document.createElement("div");
+      retry.className = "task-retry";
+
+      const access = document.createElement("div");
+      access.className = "task-access";
+      access.hidden = true;
+
+      const blocked = document.createElement("div");
+      blocked.className = "task-blocked-badge";
+      blocked.hidden = true;
+
+      meta.append(elapsed, tokens, children, retry, access, blocked);
       node.append(name, status, meta, activity);
 
       node.addEventListener("click", event => {
@@ -1523,37 +1610,57 @@
         toggleTaskDrawer(runRecord, key);
       });
 
+      node.addEventListener("keydown", event => {
+        if (key === "__empty__") return;
+        if (event.target.closest("a, button, input, select, textarea")) return;
+        if (event.key !== "Enter" && event.key !== " " && event.key !== "Spacebar") return;
+        event.preventDefault();
+        toggleTaskDrawer(runRecord, key);
+      });
+
       return {
         key,
         node,
         task: null,
         runRecord,
-        elements: {name, status, activity, elapsed, tokens, children},
+        elements: {name, status, activity, elapsed, tokens, children, retry, access, blocked},
       };
     }
 
     function updateTaskRecord(record, task, run, runRecord) {
       const status = task.status || "queued";
       const tail = taskTailText(task);
+      const tokensUnknown = isUnknownAmount(task.tokens);
       const tokens = numberOrZero(task.tokens);
       const children = numberOrZero(task.children);
+      const attempts = numberOrZero(task.attempts);
+      const passedAfterRetry = status === "pass" && attempts > 1;
       const name = task.key || "task";
       const title = task.engine ? `${name} / ${task.engine}` : name;
       const activity = taskActivityText(task, status, tail);
       const selected = openTaskRef?.runKey === runRecord.key && openTaskRef?.taskKey === record.key;
-      const taskClass = `task ${safeClass(status, "queued")}${selected ? " selected" : ""}`;
+      const taskClass = `task ${safeClass(status, "queued")}${passedAfterRetry ? " retried" : ""}${selected ? " selected" : ""}`;
+      const taskAccess = accessLabel(task);
+      const blocked = blockedReasonLabel(task);
 
       record.task = task;
       record.runRecord = runRecord;
       if (record.node.className !== taskClass) record.node.className = taskClass;
+      if (record.key !== "__empty__") record.node.setAttribute("aria-expanded", String(selected));
       setText(record.elements.name, name);
       setTitle(record.elements.name, title);
       setText(record.elements.status, status);
       setText(record.elements.activity, activity);
       setTitle(record.elements.activity, activity);
       setText(record.elements.elapsed, fmtElapsed(task.elapsed_s));
-      setText(record.elements.tokens, formatTokens(tokens));
+      setText(record.elements.tokens, formatTokens(tokens, tokensUnknown));
       setText(record.elements.children, children > 0 ? `p${children}` : "");
+      setText(record.elements.retry, attempts > 1 ? (passedAfterRetry ? `passed after retry ×${attempts}` : `retry ×${attempts}`) : "");
+      setHidden(record.elements.access, taskAccess === null);
+      setText(record.elements.access, taskAccess ? `access ${taskAccess}` : "");
+      setHidden(record.elements.blocked, blocked === null);
+      setText(record.elements.blocked, blocked ? `blocked: ${blocked}` : "");
+      setTitle(record.elements.blocked, blocked ? `blocked: ${blocked}` : "");
 
       if (selected) updateDrawerContent(runRecord, run, task);
     }
@@ -1565,6 +1672,7 @@
           `<span class="drawer-status" data-drawer-status></span>`,
           `<span class="drawer-meta-line" data-drawer-meta></span>`,
           `</div>`,
+          `<div class="drawer-blocked" data-drawer-blocked hidden></div>`,
           `<pre class="worker-stream" data-worker-stream aria-live="polite">loading worker log...</pre>`,
           `<details class="drawer-config" data-drawer-config>`,
           `<summary>configuration</summary>`,
@@ -1577,6 +1685,7 @@
       return {
         status: drawer.querySelector("[data-drawer-status]"),
         meta: drawer.querySelector("[data-drawer-meta]"),
+        blocked: drawer.querySelector("[data-drawer-blocked]"),
         stream: drawer.querySelector("[data-worker-stream]"),
         configBody: drawer.querySelector("[data-drawer-config-body]"),
       };
@@ -1594,12 +1703,17 @@
       const check = String(task.check || "").trim() || "No check command recorded.";
       const checkOutput = String(task.check_output_tail || "").trim() || "No check output recorded yet.";
       const links = taskLinksHtml(run, task) || `<span>no files linked</span>`;
-      const meta = [
+      const taskAccess = accessLabel(task) || accessLabel(run);
+      const metaParts = [
         `attempts ${attempts}`,
         `engine ${task.engine || "unknown"}`,
         `elapsed ${fmtElapsed(task.elapsed_s)}`,
         `rc ${rc}${timedOut}${verdict}`,
-      ].join(" · ");
+      ];
+      if (taskAccess) metaParts.push(`access ${taskAccess}`);
+      if (status === "pass" && attempts > 1) metaParts.push("passed after retry");
+      const meta = metaParts.join(" · ");
+      const blocked = blockedReasonLabel(task);
       const configHtml = [
         `<div class="drawer-links">${links}</div>`,
         `<div class="drawer-label">Prompt</div>`,
@@ -1613,6 +1727,8 @@
       refs.status.className = `drawer-status ${safeClass(status, "queued")}`;
       setText(refs.status, status);
       setText(refs.meta, meta);
+      setHidden(refs.blocked, blocked === null);
+      setText(refs.blocked, blocked ? `blocked: ${blocked}` : "");
       if (refs.configBody.innerHTML !== configHtml) refs.configBody.innerHTML = configHtml;
       syncWorkerLogPanel(run, task, refs.stream);
     }
@@ -1623,6 +1739,7 @@
       const runRecord = runNodes.get(openTaskRef.runKey);
       const taskRecord = runRecord?.tasks.get(openTaskRef.taskKey);
       taskRecord?.node.classList.remove("selected");
+      taskRecord?.node.setAttribute("aria-expanded", "false");
       if (runRecord?.elements.drawer.isConnected) runRecord.elements.drawer.remove();
       if (runRecord) runRecord.elements.drawer.hidden = true;
       openTaskRef = null;
@@ -1669,7 +1786,10 @@
         closeTaskDrawer();
         return;
       }
-      for (const [, record] of runRecord.tasks) record.node.classList.toggle("selected", record === taskRecord);
+      for (const [, record] of runRecord.tasks) {
+        record.node.classList.toggle("selected", record === taskRecord);
+        if (record.key !== "__empty__") record.node.setAttribute("aria-expanded", String(record === taskRecord));
+      }
       updateDrawerContent(runRecord, runRecord.run, taskRecord.task);
       placeDrawerAfterRow(runRecord, taskRecord.node);
     }
@@ -1677,9 +1797,12 @@
     function updateRunRecord(record, run) {
       const identity = run.identity || "unknown";
       const name = run.run_name || "ringer";
-      const final = run.state === "live"
-        ? `ok ${run.pass} fail ${run.fail}`
-        : (run.state === "died" ? `died · ok ${run.pass} fail ${run.fail}` : `ok ${run.pass} fail ${run.fail}`);
+      const passText = formatCount(run.pass, run.passUnknown);
+      const failText = formatCount(run.fail, run.failUnknown);
+      const final = run.state === "died"
+        ? `died · ok ${passText} fail ${failText}`
+        : `ok ${passText} fail ${failText}`;
+      const runAccess = accessLabel(run);
 
       record.run = run;
       setStateClass(record.node, "run", run.state);
@@ -1689,8 +1812,10 @@
       setTitle(record.elements.name, name);
       setText(record.elements.identity, identity);
       setTitle(record.elements.identity, identity);
+      setHidden(record.elements.access, runAccess === null);
+      setText(record.elements.access, runAccess ? `access ${runAccess}` : "");
       setText(record.elements.elapsed, fmtElapsed(run.elapsed_s));
-      setText(record.elements.tokens, formatTokens(run.tokens));
+      setText(record.elements.tokens, formatTokens(run.tokens, run.tokensUnknown));
       setText(record.elements.final, final);
       syncTaskNodes(record, run.tasks, run);
     }

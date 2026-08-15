@@ -1,0 +1,2 @@
+# False positive: historical Ringer task identifier, not an authentication credential.
+2c2b599c51b7286130452e808655105001b7fc68:templates/bakeoff-kit/swarm.model-only.example.json:generic-api-key:7
