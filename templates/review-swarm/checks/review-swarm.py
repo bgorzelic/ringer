@@ -25,6 +25,11 @@ FINDING_HEADING_CANDIDATE_RE = re.compile(
     re.IGNORECASE | re.MULTILINE,
 )
 
+# Only these headings terminate a section extraction. A malformed level-2
+# '## Finding: ...' block is not a canonical heading, so it stays inside the
+# Findings region instead of prematurely closing it.
+CANONICAL_HEADING_PATTERN = "|".join(re.escape(heading) for heading in REQUIRED_HEADINGS)
+
 
 def fail(name: str, detail: str) -> str:
     return f"FAIL [{name}]: {detail}"
@@ -40,7 +45,8 @@ def has_heading(text: str, heading: str) -> bool:
 
 def section(text: str, heading: str) -> str:
     pattern = re.compile(
-        rf"^##\s+{re.escape(heading)}\s*$([\s\S]*?)(?=^##\s+|\Z)",
+        rf"^##\s+{re.escape(heading)}\s*$([\s\S]*?)"
+        rf"(?=^##\s+(?:{CANONICAL_HEADING_PATTERN})\s*$|\Z)",
         re.IGNORECASE | re.MULTILINE,
     )
     match = pattern.search(text)
@@ -95,6 +101,8 @@ def validate_report(path: Path, surface: str) -> list[str]:
             failures.append(fail("missing_section", f"missing '## {heading}'"))
 
     summary = section(text, "Summary")
+    if not summary:
+        failures.append(fail("summary_empty", "Summary section has no content"))
     summary_lines = [line for line in summary.splitlines() if line.strip()]
     if len(summary_lines) > 3:
         failures.append(fail("summary_too_long", "Summary must be no more than 3 non-empty lines"))
@@ -111,8 +119,13 @@ def validate_report(path: Path, surface: str) -> list[str]:
             failures.append(fail("findings_not_explicit", "Findings must contain at least one '### Finding:' block or say 'No findings'"))
 
     clean = section(text, "Clean")
-    if clean and len([line for line in clean.splitlines() if line.strip()]) < 1:
-        failures.append(fail("clean_not_explicit", "Clean section must name reviewed dimensions with no findings"))
+    if not clean:
+        failures.append(fail("clean_not_explicit", "Clean section must name at least one reviewed dimension with no findings"))
+
+    assumptions = section(text, "Assumptions")
+    if not assumptions:
+        failures.append(fail("assumptions_empty", "Assumptions section has no content"))
+
     if OPEN_PLACEHOLDER in surface or CLOSE_PLACEHOLDER in surface:
         failures.append(fail("placeholder_unfilled", "surface placeholder was not filled in the check command"))
     return failures

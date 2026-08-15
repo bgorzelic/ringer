@@ -138,6 +138,57 @@ Confidence: maybe"""
             f"expected too_long failure, got: {failures}",
         )
 
+    def test_level2_malformed_finding_heading_returns_all_defects(self) -> None:
+        # A prior bug in section() treated ANY '^##\s+' line as a section
+        # boundary, so a malformed level-2 '## Finding: ...' block was
+        # treated as closing the Findings section early and its own
+        # defects (bad heading, missing/invalid fields) were silently
+        # dropped from validation. It must stay inside the Findings region.
+        block = """## Finding: missing HTTPS redirect
+Evidence: app/server.py:15 serves plaintext
+Fix: force TLS
+Priority: Severe
+Confidence: high"""
+        report = VALID_REPORT.replace(VALID_FINDING, block)
+        failures = validate_report(self.write_report(report), "login surface")
+
+        self.assertFalse(
+            any("missing_findings_body" in item for item in failures),
+            f"Findings body should not appear empty: {failures}",
+        )
+        self.assertTrue(
+            any("finding_bad_heading" in item for item in failures),
+            f"expected a bad-heading failure, got: {failures}",
+        )
+        self.assertTrue(
+            any("finding_missing_field" in item and "Impact:" in item for item in failures),
+            f"expected a missing-Impact failure, got: {failures}",
+        )
+        self.assertTrue(
+            any("finding_bad_priority" in item for item in failures),
+            f"expected a bad-priority failure, got: {failures}",
+        )
+
+    def test_empty_summary_section_fails(self) -> None:
+        report = VALID_REPORT.replace("Reviewed the login surface for auth and data-access issues.\n", "")
+        failures = validate_report(self.write_report(report), "login surface")
+        self.assertTrue(any("summary_empty" in item for item in failures), failures)
+
+    def test_empty_findings_section_fails(self) -> None:
+        report = VALID_REPORT.replace(VALID_FINDING, "")
+        failures = validate_report(self.write_report(report), "login surface")
+        self.assertTrue(any("missing_findings_body" in item for item in failures), failures)
+
+    def test_empty_clean_section_fails(self) -> None:
+        report = VALID_REPORT.replace("- CSRF handling looked correct.\n", "")
+        failures = validate_report(self.write_report(report), "login surface")
+        self.assertTrue(any("clean_not_explicit" in item for item in failures), failures)
+
+    def test_empty_assumptions_section_fails(self) -> None:
+        report = VALID_REPORT.replace("- Session store config was out of scope.\n", "")
+        failures = validate_report(self.write_report(report), "login surface")
+        self.assertTrue(any("assumptions_empty" in item for item in failures), failures)
+
     def test_missing_report_fails(self) -> None:
         missing_path = Path(tempfile.mkdtemp()) / "does-not-exist.md"
         failures = validate_report(missing_path, "login surface")

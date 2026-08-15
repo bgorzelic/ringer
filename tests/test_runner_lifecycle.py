@@ -190,7 +190,7 @@ class ExpectedFileFreshnessTests(unittest.IsolatedAsyncioTestCase):
                 check=f"printf 'patch data\\n' > {shlex.quote(str(exported))}",
                 expect_files=(str(exported),),
             )
-            verifier = Verifier()
+            verifier = Verifier(workdir=root)
             before = verifier.snapshot_expected_files(task, taskdir)
 
             result = await verifier.verify(task, taskdir, before)
@@ -198,7 +198,7 @@ class ExpectedFileFreshnessTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(result.ok, result.raw_output_excerpt)
             self.assertEqual("patch data\n", exported.read_text(encoding="utf-8"))
 
-    async def test_identical_absolute_export_rewritten_by_check_is_fresh(self) -> None:
+    async def test_identical_absolute_export_rewritten_by_check_is_stale(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             taskdir = root / "task"
@@ -217,13 +217,13 @@ class ExpectedFileFreshnessTests(unittest.IsolatedAsyncioTestCase):
                 ),
                 expect_files=(str(exported),),
             )
-            verifier = Verifier()
+            verifier = Verifier(workdir=root)
             before = verifier.snapshot_expected_files(task, taskdir)
 
             result = await verifier.verify(task, taskdir, before)
 
-            self.assertTrue(result.ok, result.raw_output_excerpt)
-            self.assertEqual((), result.stale_files)
+            self.assertFalse(result.ok)
+            self.assertEqual((str(exported),), result.stale_files)
 
 
 class UnexpectedRunnerFailureTests(unittest.IsolatedAsyncioTestCase):

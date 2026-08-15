@@ -32,6 +32,7 @@ class LintManifestTests(unittest.TestCase):
         *,
         worktrees: bool = False,
         max_parallel: int = 1,
+        external_expect_roots: list[str] | None = None,
     ) -> Manifest:
         temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(temp_dir.cleanup)
@@ -42,6 +43,8 @@ class LintManifestTests(unittest.TestCase):
             "worktrees": worktrees,
             "tasks": tasks,
         }
+        if external_expect_roots is not None:
+            obj["external_expect_roots"] = external_expect_roots
         if worktrees:
             obj["repo"] = temp_dir.name
         return Manifest.from_obj(obj)
@@ -202,10 +205,12 @@ class LintManifestTests(unittest.TestCase):
                 self.task("two", expect_files=["/tmp/shared-deliverable.txt"]),
             ],
             worktrees=False,
+            external_expect_roots=["/tmp"],
         )
+        canonical = Path("/tmp/shared-deliverable.txt").resolve()
         self.assertHasFinding(
             lint_manifest(manifest),
-            "manifest: write collision on /tmp/shared-deliverable.txt: listed by one, two.",
+            f"manifest: write collision on {canonical}: listed by one, two.",
         )
 
     def test_w6_relative_paths_do_not_collide(self) -> None:
@@ -239,7 +244,12 @@ class LintManifestTests(unittest.TestCase):
                     check="true",
                     expect_files=("~/report.md",),
                 )
-                result = asyncio.run(Verifier().verify(task, taskdir))
+                result = asyncio.run(
+                    Verifier(
+                        workdir=taskdir,
+                        external_expect_roots=(home,),
+                    ).verify(task, taskdir)
+                )
             finally:
                 if previous_home is None:
                     os.environ.pop("HOME", None)

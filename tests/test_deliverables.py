@@ -114,7 +114,13 @@ class DeliverableTests(unittest.TestCase):
         os.environ.clear()
         os.environ.update(self.old_env)
 
-    def manifest(self, task: TaskSpec, *, worktrees: bool = False) -> Manifest:
+    def manifest(
+        self,
+        task: TaskSpec,
+        *,
+        worktrees: bool = False,
+        external_expect_roots: tuple[Path, ...] = (),
+    ) -> Manifest:
         obj: dict[str, object] = {
             "run_name": "Deliverable Run",
             "workdir": str(self.workdir),
@@ -130,22 +136,44 @@ class DeliverableTests(unittest.TestCase):
                 }
             ],
         }
+        if external_expect_roots:
+            obj["external_expect_roots"] = [str(path) for path in external_expect_roots]
         if worktrees:
             repo = self.root / "repo"
             repo.mkdir()
             obj["repo"] = str(repo)
         return Manifest.from_obj(obj)
 
-    def runner(self, task: TaskSpec, *, worktrees: bool = False) -> RingerRunner:
+    def runner(
+        self,
+        task: TaskSpec,
+        *,
+        worktrees: bool = False,
+        external_expect_roots: tuple[Path, ...] = (),
+    ) -> RingerRunner:
         return RingerRunner(
-            self.manifest(task, worktrees=worktrees),
+            self.manifest(
+                task,
+                worktrees=worktrees,
+                external_expect_roots=external_expect_roots,
+            ),
             self.config,
             "test-agent",
             dashboard_enabled=False,
         )
 
-    def runtime_for(self, task: TaskSpec, *, worktrees: bool = False) -> tuple[RingerRunner, TaskRuntime]:
-        runner = self.runner(task, worktrees=worktrees)
+    def runtime_for(
+        self,
+        task: TaskSpec,
+        *,
+        worktrees: bool = False,
+        external_expect_roots: tuple[Path, ...] = (),
+    ) -> tuple[RingerRunner, TaskRuntime]:
+        runner = self.runner(
+            task,
+            worktrees=worktrees,
+            external_expect_roots=external_expect_roots,
+        )
         runtime = runner.runtimes[0]
         runtime.taskdir.mkdir(parents=True, exist_ok=True)
         runtime.log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -172,7 +200,10 @@ class DeliverableTests(unittest.TestCase):
             engine="mock",
             expect_files=("site-final.html", str(absolute_doc), "~/home-read.md", "missing.txt", "huge.bin"),
         )
-        runner, runtime = self.runtime_for(task)
+        runner, runtime = self.runtime_for(
+            task,
+            external_expect_roots=(self.root / "outside", Path(os.environ["HOME"])),
+        )
         (runtime.taskdir / "site-final.html").write_text("<h1>done</h1>\n", encoding="utf-8")
         self.make_large_file(runtime.taskdir / "huge.bin")
 

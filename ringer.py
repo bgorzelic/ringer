@@ -310,6 +310,14 @@ def as_env_allowlist(value: Any, *, key: str) -> tuple[str, ...]:
     return tuple(dict.fromkeys(names))
 
 
+def validate_executable_declaration(executable: str, *, key: str) -> None:
+    if "/" in executable and not Path(executable).is_absolute():
+        raise ValueError(
+            f"{key} must be a bare executable name or an absolute path; "
+            f"slash-containing relative paths are not allowed: {executable}"
+        )
+
+
 def built_in_codex_engine() -> EngineConfig:
     resolved = shutil.which(DEFAULT_ENGINE_NAME) or DEFAULT_ENGINE_NAME
     return EngineConfig(
@@ -384,6 +392,7 @@ def load_engines(raw: Any) -> dict[str, EngineConfig]:
         bin_path = str(section.get("bin", default_bin)).strip()
         if not bin_path:
             raise ValueError(f"engines.{clean_name}.bin must not be empty")
+        validate_executable_declaration(bin_path, key=f"engines.{clean_name}.bin")
         args_template = as_string_tuple(
             section.get("args_template", list(base.args_template) if base else None),
             key=f"engines.{clean_name}.args_template",
@@ -420,6 +429,11 @@ def load_engines(raw: Any) -> dict[str, EngineConfig]:
             ),
             key=f"engines.{clean_name}.preflight_executables",
         )
+        for executable in preflight_executables:
+            validate_executable_declaration(
+                executable,
+                key=f"engines.{clean_name}.preflight_executables",
+            )
         engines[clean_name] = EngineConfig(
             name=clean_name,
             bin=bin_path,
@@ -512,6 +526,7 @@ class Manifest:
     worktrees: bool
     repo: Path | None
     tasks: tuple[TaskSpec, ...]
+    external_expect_roots: tuple[Path, ...] = ()
     source_path: Path | None = None
 
     @classmethod
@@ -527,6 +542,7 @@ class Manifest:
             worktrees=manifest.worktrees,
             repo=manifest.repo,
             tasks=manifest.tasks,
+            external_expect_roots=manifest.external_expect_roots,
             source_path=path,
         )
 
@@ -546,6 +562,18 @@ class Manifest:
             raise ValueError("max_parallel must be positive")
         repo_raw = obj.get("repo")
         repo = Path(str(repo_raw)).expanduser().resolve() if repo_raw else None
+        external_expect_roots_raw = obj.get("external_expect_roots", [])
+        if not isinstance(external_expect_roots_raw, list):
+            raise ValueError("external_expect_roots must be a list")
+        external_expect_roots_list: list[Path] = []
+        for item in external_expect_roots_raw:
+            if not isinstance(item, str) or not item.strip():
+                raise ValueError("external_expect_roots entries must be non-empty strings")
+            root = Path(item)
+            if not root.is_absolute():
+                raise ValueError("external_expect_roots entries must be absolute")
+            external_expect_roots_list.append(root.resolve())
+        external_expect_roots = tuple(dict.fromkeys(external_expect_roots_list))
         tasks_raw = obj.get("tasks")
         if not isinstance(tasks_raw, list) or not tasks_raw:
             raise ValueError("tasks must be a non-empty list")
@@ -569,6 +597,15 @@ class Manifest:
                     "task key(s) collide with reserved worktree logs directory "
                     f"'logs': {', '.join(collisions)}"
                 )
+        for task in tasks:
+            taskdir = (workdir / task.key).resolve()
+            for path in task.expect_files:
+                resolve_expected_file_path(
+                    taskdir,
+                    path,
+                    workdir=workdir,
+                    external_expect_roots=external_expect_roots,
+                )
         return cls(
             run_name=run_name,
             workdir=workdir,
@@ -576,6 +613,7 @@ class Manifest:
             worktrees=worktrees,
             repo=repo,
             tasks=tasks,
+            external_expect_roots=external_expect_roots,
         )
 
     def with_max_parallel(self, value: int | None) -> "Manifest":
@@ -590,6 +628,7 @@ class Manifest:
             worktrees=self.worktrees,
             repo=self.repo,
             tasks=self.tasks,
+            external_expect_roots=self.external_expect_roots,
             source_path=self.source_path,
         )
 
@@ -645,20 +684,29 @@ def lint_manifest(manifest: Manifest, *, include_model_log_nudges: bool = False)
     if len(manifest.tasks) >= 3 and manifest.max_parallel == 1:
         findings.append("manifest: tasks will run serially; set max_parallel.")
 
-    if not manifest.worktrees:
-        # Relative expect_files resolve inside each task's own directory and
-        # cannot collide; only a shared absolute path is a real collision.
-        paths_to_tasks: dict[str, list[str]] = {}
-        for task in manifest.tasks:
-            for path in task.expect_files:
-                if not Path(path).expanduser().is_absolute():
-                    continue
-                paths_to_tasks.setdefault(path, []).append(task.key)
-        for path, task_keys in paths_to_tasks.items():
-            if len(task_keys) >= 2:
-                findings.append(
-                    f"manifest: write collision on {path}: listed by {', '.join(task_keys)}."
+    # Compare canonical targets. Relative outputs normally remain distinct
+    # because each resolves beneath its own task directory, while absolute
+    # aliases and symlink aliases must still collide.
+    paths_to_tasks: dict[str, list[str]] = {}
+    for task in manifest.tasks:
+        taskdir = (manifest.workdir / task.key).resolve()
+        for path in task.expect_files:
+            try:
+                target = resolve_expected_file_path(
+                    taskdir,
+                    path,
+                    workdir=manifest.workdir,
+                    external_expect_roots=manifest.external_expect_roots,
                 )
+            except ValueError as exc:
+                findings.append(f"{task.key}: {exc}")
+                continue
+            paths_to_tasks.setdefault(str(target), []).append(task.key)
+    for path, task_keys in paths_to_tasks.items():
+        if len(task_keys) >= 2:
+            findings.append(
+                f"manifest: write collision on {path}: listed by {', '.join(task_keys)}."
+            )
 
     return findings
 
@@ -752,10 +800,17 @@ def consists_only_of_echo_commands(command: str) -> bool:
 
 def check_may_fail_silently(check: str) -> bool:
     stripped = strip_shell_comments(check).strip()
-    if has_quiet_diff_probe(stripped):
-        return not has_failure_output_branch(stripped)
-    if not stripped or "||" in stripped:
+    if not stripped:
         return False
+    if "||" in stripped:
+        probe, _branch = stripped.split("||", 1)
+        probe_parts = [part.strip() for part in probe.split("&&") if part.strip()]
+        has_silent_failure = has_quiet_diff_probe(probe) or any(
+            is_silent_probe(part) for part in probe_parts
+        )
+        return has_silent_failure and not has_failure_output_branch(stripped)
+    if has_quiet_diff_probe(stripped):
+        return True
     if re.search(r"(?:;|\n|\|)", stripped):
         return False
     parts = [part.strip() for part in stripped.split("&&") if part.strip()]
@@ -770,11 +825,34 @@ def has_failure_output_branch(command: str) -> bool:
     if "||" not in command:
         return False
     branch = command.split("||", 1)[1]
-    return any(
-        has_command_prefix(part, (prefix,))
-        for part in command_parts(branch)
-        for prefix in ("echo", "printf", "cat", "diff", "ls")
+    for part in command_parts(branch):
+        if command_prints_visible_failure(part):
+            return True
+        if has_command_prefix(part, ("exit",)) or has_command_prefix(part, ("false",)):
+            return False
+    return False
+
+
+def command_prints_visible_failure(command: str) -> bool:
+    cleaned = command.strip(" \t{}()")
+    try:
+        tokens = shlex.split(cleaned)
+    except ValueError:
+        return False
+    if not tokens or tokens[0] not in {"echo", "printf", "cat", "diff", "ls"}:
+        return False
+    if tokens[0] in {"echo", "printf"} and len(tokens) < 2:
+        return False
+    # stderr is captured by Ringer, so >&2 remains useful. Any other stdout
+    # redirection hides the diagnostic from the retry prompt and eval log.
+    without_visible_stderr = re.sub(
+        r"(?:^|\s)1?>&2(?=\s|$)",
+        " ",
+        cleaned,
     )
+    if re.search(r"(?:^|\s)(?:1?>>?|&>|>&)", without_visible_stderr):
+        return False
+    return True
 
 
 def command_parts(command: str) -> list[str]:
@@ -823,6 +901,38 @@ def strip_common_redirections(command: str) -> str:
 
 def is_relative_expect_file(path: str) -> bool:
     return bool(path.strip()) and not path.startswith("~") and not Path(path).is_absolute()
+
+
+def path_is_within(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def resolve_expected_file_path(
+    taskdir: Path,
+    path: str,
+    *,
+    workdir: Path | None,
+    external_expect_roots: Iterable[Path] = (),
+) -> Path:
+    """Resolve one expected output and enforce its declared trust boundary."""
+    raw = Path(path).expanduser()
+    task_root = taskdir.resolve()
+    if raw.is_absolute():
+        target = raw.resolve()
+        allowed_roots = tuple(root.resolve() for root in external_expect_roots)
+        if workdir is not None:
+            allowed_roots = (workdir.resolve(), *allowed_roots)
+        if not allowed_roots or not any(path_is_within(target, root) for root in allowed_roots):
+            raise ValueError(
+                f"absolute expected file escapes manifest workdir and external_expect_roots: {path}"
+            )
+        return target
+    if ".." in raw.parts:
+        raise ValueError(f"relative expected file must not contain '..': {path}")
+    target = (task_root / raw).resolve()
+    if not path_is_within(target, task_root):
+        raise ValueError(f"relative expected file escapes task directory: {path}")
+    return target
 
 
 def instructs_git_commit(spec: str) -> bool:
@@ -891,13 +1001,13 @@ class VerifyResult:
     raw_output_excerpt: str
     missing_files: tuple[str, ...] = ()
     stale_files: tuple[str, ...] = ()
+    invalid_files: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
 class ExpectedFileFingerprint:
     size: int
     sha256: str | None
-    mtime_ns: int
 
 
 class ProcessTree:
@@ -6775,6 +6885,20 @@ def run_models_command(config: AppConfig, args: argparse.Namespace) -> int:
 
 
 class Verifier:
+    def __init__(
+        self,
+        manifest: Manifest | None = None,
+        *,
+        workdir: Path | None = None,
+        external_expect_roots: Iterable[Path] = (),
+    ) -> None:
+        self.workdir = manifest.workdir if manifest is not None else workdir
+        self.external_expect_roots = (
+            manifest.external_expect_roots
+            if manifest is not None
+            else tuple(external_expect_roots)
+        )
+
     async def verify(
         self,
         task: TaskSpec,
@@ -6782,8 +6906,16 @@ class Verifier:
         expected_files_before: Mapping[str, ExpectedFileFingerprint | None] | None = None,
     ) -> VerifyResult:
         check_returncode, check_timed_out, output = await self._run_check(task.check, taskdir)
+        expected_paths: dict[str, Path] = {}
+        invalid_messages: dict[str, str] = {}
+        for rel in task.expect_files:
+            try:
+                expected_paths[rel] = self._expect_file_path(taskdir, rel)
+            except ValueError as exc:
+                invalid_messages[rel] = str(exc)
+        invalid_files = tuple(invalid_messages)
         missing_files = tuple(
-            rel for rel in task.expect_files if not self._is_nonempty_file(self._expect_file_path(taskdir, rel))
+            rel for rel, target in expected_paths.items() if not self._is_nonempty_file(target)
         )
         stale_files = ()
         if expected_files_before is not None:
@@ -6791,12 +6923,24 @@ class Verifier:
                 rel
                 for rel in task.expect_files
                 if rel not in missing_files
+                and rel not in invalid_files
                 and expected_files_before.get(rel) is not None
                 and expected_files_before.get(rel)
-                == self._file_fingerprint(self._expect_file_path(taskdir, rel))
+                == self._file_fingerprint(expected_paths[rel])
             )
-        ok = not missing_files and not stale_files and not check_timed_out and check_returncode == 0
+        ok = (
+            not invalid_files
+            and not missing_files
+            and not stale_files
+            and not check_timed_out
+            and check_returncode == 0
+        )
         messages = []
+        if invalid_files:
+            messages.extend(
+                f"[ringer] unsafe expected file path: {message}"
+                for message in invalid_messages.values()
+            )
         if missing_files:
             messages.append(f"[ringer] missing expected files: {', '.join(missing_files)}")
         if stale_files:
@@ -6822,18 +6966,23 @@ class Verifier:
             raw_output_excerpt=output[:2000],
             missing_files=missing_files,
             stale_files=stale_files,
+            invalid_files=invalid_files,
         )
 
-    @classmethod
     def snapshot_expected_files(
-        cls,
+        self,
         task: TaskSpec,
         taskdir: Path,
     ) -> dict[str, ExpectedFileFingerprint | None]:
-        return {
-            path: cls._file_fingerprint(cls._expect_file_path(taskdir, path))
-            for path in task.expect_files
-        }
+        snapshots: dict[str, ExpectedFileFingerprint | None] = {}
+        for path in task.expect_files:
+            try:
+                target = self._expect_file_path(taskdir, path)
+            except ValueError:
+                snapshots[path] = None
+                continue
+            snapshots[path] = self._file_fingerprint(target)
+        return snapshots
 
     @staticmethod
     def _file_fingerprint(path: Path) -> ExpectedFileFingerprint | None:
@@ -6851,13 +7000,11 @@ class Verifier:
             return ExpectedFileFingerprint(
                 size=stat.st_size,
                 sha256=digest.hexdigest(),
-                mtime_ns=stat.st_mtime_ns,
             )
         except OSError:
             return ExpectedFileFingerprint(
                 size=stat.st_size,
                 sha256=None,
-                mtime_ns=stat.st_mtime_ns,
             )
 
     @staticmethod
@@ -6867,11 +7014,13 @@ class Verifier:
         except OSError:
             return False
 
-    @staticmethod
-    def _expect_file_path(taskdir: Path, path: str) -> Path:
-        candidate = Path(path).expanduser()
-        # Keep runtime verification aligned with lint's treatment of "~" paths.
-        return candidate if candidate.is_absolute() else taskdir / candidate
+    def _expect_file_path(self, taskdir: Path, path: str) -> Path:
+        return resolve_expected_file_path(
+            taskdir,
+            path,
+            workdir=self.workdir,
+            external_expect_roots=self.external_expect_roots,
+        )
 
     @staticmethod
     async def _run_check(command: str, cwd: Path) -> tuple[int | None, bool, str]:
@@ -6888,24 +7037,12 @@ class Verifier:
             stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=CHECK_TIMEOUT_S)
         except asyncio.TimeoutError:
             timed_out = True
-            terminate_process_group(proc)
-            try:
-                stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
-            except asyncio.TimeoutError:
-                kill_process_group(proc)
-                stdout, _ = await proc.communicate()
+            await terminate_process_group_after_grace(proc.pid, proc, grace_s=5)
+            stdout, _ = await proc.communicate()
         except asyncio.CancelledError:
-            terminate_process_group(proc)
-            try:
-                await asyncio.wait_for(proc.communicate(), timeout=5)
-            except asyncio.TimeoutError:
-                kill_process_group(proc)
-                with contextlib.suppress(Exception):
-                    await proc.communicate()
-            except Exception:
-                kill_process_group(proc)
-                with contextlib.suppress(Exception):
-                    await proc.communicate()
+            await terminate_process_group_after_grace(proc.pid, proc, grace_s=5)
+            with contextlib.suppress(Exception):
+                await proc.communicate()
             raise
         output = stdout.decode("utf-8", errors="replace") if stdout else ""
         if timed_out:
@@ -6953,9 +7090,11 @@ class RingerRunner:
             else None
         )
         self.logger = EvalLogger(config.eval)
-        self.verifier = Verifier()
+        self.verifier = Verifier(manifest)
         self.semaphore = asyncio.Semaphore(manifest.max_parallel)
-        self.active_processes: dict[int, asyncio.subprocess.Process] = {}
+        # A process-group ID remains actionable after its leader exits, so
+        # cleanup must not be keyed only to Process.returncode.
+        self.active_process_groups: dict[int, asyncio.subprocess.Process] = {}
 
     async def run(self) -> int:
         final_state = False
@@ -7013,24 +7152,17 @@ class RingerRunner:
                     print("Open it in a browser, or run './ringer.py hud' for the full Ringside view (http://127.0.0.1:8700).")
 
     async def kill_all_workers(self) -> None:
-        procs = list(self.active_processes.values())
-        for proc in procs:
-            if proc.returncode is None:
-                terminate_process_group(proc)
-        pending = [proc for proc in procs if proc.returncode is None]
-        if pending:
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*(proc.wait() for proc in pending), return_exceptions=True),
-                    timeout=1,
-                )
-            except asyncio.TimeoutError:
-                for proc in pending:
-                    if proc.returncode is None:
-                        kill_process_group(proc)
-                await asyncio.gather(*(proc.wait() for proc in pending), return_exceptions=True)
-        for proc in procs:
-            self.active_processes.pop(proc.pid, None)
+        groups = list(self.active_process_groups.items())
+        if groups:
+            await asyncio.gather(
+                *(
+                    terminate_process_group_after_grace(pgid, proc, grace_s=1)
+                    for pgid, proc in groups
+                ),
+                return_exceptions=True,
+            )
+        for pgid, _proc in groups:
+            self.active_process_groups.pop(pgid, None)
 
     def _mark_unfinished_tasks_failed(self, reason: str) -> None:
         now = time.monotonic()
@@ -7137,7 +7269,14 @@ class RingerRunner:
                 candidates = candidates[:FALLBACK_HARVEST_MAX_FILES]
             expect_files = tuple(candidates)
         for expect_path in expect_files:
-            source = Verifier._expect_file_path(runtime.taskdir, expect_path)
+            try:
+                source = self.verifier._expect_file_path(runtime.taskdir, expect_path)
+            except ValueError as exc:
+                append_text(
+                    runtime.log_path,
+                    f"[ringer.py] unsafe deliverable path rejected for {expect_path}: {exc}\n",
+                )
+                continue
             try:
                 stat = source.stat()
             except OSError:
@@ -7310,26 +7449,32 @@ class RingerRunner:
                 return WorkerResult(returncode=None, timed_out=False, tokens=None, error=str(exc))
             with self.lock:
                 runtime.worker_pid = proc.pid
-            self.active_processes[proc.pid] = proc
+            pgid = proc.pid
+            self.active_process_groups[pgid] = proc
             reader = asyncio.create_task(self._tee_stream(proc, log_fh, capture))
             timed_out = False
             try:
-                await asyncio.wait_for(proc.wait(), timeout=runtime.task.timeout_s)
-            except asyncio.TimeoutError:
-                timed_out = True
-                terminate_process_group(proc)
                 try:
-                    await asyncio.wait_for(proc.wait(), timeout=5)
+                    await asyncio.wait_for(proc.wait(), timeout=runtime.task.timeout_s)
                 except asyncio.TimeoutError:
-                    kill_process_group(proc)
-                    await proc.wait()
-            try:
-                await asyncio.wait_for(reader, timeout=5)
-            except asyncio.TimeoutError:
-                reader.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await reader
-            self.active_processes.pop(proc.pid, None)
+                    timed_out = True
+                    await terminate_process_group_after_grace(pgid, proc, grace_s=5)
+                else:
+                    # The leader may exit while a background descendant keeps
+                    # the session alive. Close that group before forgetting it.
+                    if process_group_exists(pgid):
+                        await terminate_process_group_after_grace(pgid, proc, grace_s=5)
+            except asyncio.CancelledError:
+                await terminate_process_group_after_grace(pgid, proc, grace_s=5)
+                raise
+            finally:
+                try:
+                    await asyncio.wait_for(reader, timeout=5)
+                except asyncio.TimeoutError:
+                    reader.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await reader
+                self.active_process_groups.pop(pgid, None)
         output_tail = capture.text()
         tokens = parse_token_count(output_tail, engine.token_regex)
         if timed_out:
@@ -7382,6 +7527,8 @@ class RingerRunner:
             notes_parts.append(f"missing_expect_files={json.dumps(list(verify.missing_files))}")
         if verify.stale_files:
             notes_parts.append(f"stale_expect_files={json.dumps(list(verify.stale_files))}")
+        if verify.invalid_files:
+            notes_parts.append(f"invalid_expect_files={json.dumps(list(verify.invalid_files))}")
         notes_parts.append("raw_check_output_first_2000_chars:")
         notes_parts.append(verify.raw_output_excerpt)
         self.logger.log_attempt(
@@ -7465,7 +7612,7 @@ def verdict_for(worker: WorkerResult, verify: VerifyResult) -> str:
         return "ERROR"
     if worker.timed_out or verify.check_timed_out:
         return "TIMEOUT"
-    if verify.ok:
+    if worker.returncode == 0 and verify.ok:
         return "PASS"
     return "FAIL"
 
@@ -7633,6 +7780,14 @@ def preflight_engine_bins(manifest: Manifest, config: AppConfig) -> None:
             if executable in checked:
                 continue
             checked.add(executable)
+            validate_executable_declaration(
+                executable,
+                key=(
+                    f"engines.{name}.bin"
+                    if declaration == "binary"
+                    else f"engines.{name}.preflight_executables"
+                ),
+            )
             if os.sep in executable:
                 found = Path(executable).expanduser()
                 missing = not (found.is_file() and os.access(found, os.X_OK))
@@ -7901,28 +8056,62 @@ def append_text(path: Path, text: str) -> None:
         fh.write(text)
 
 
-def terminate_process_group(proc: asyncio.subprocess.Process) -> None:
+def process_group_exists(pgid: int) -> bool:
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
+        os.killpg(pgid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def terminate_process_group(pgid: int, proc: asyncio.subprocess.Process | None = None) -> None:
+    try:
+        os.killpg(pgid, signal.SIGTERM)
     except ProcessLookupError:
         return
     except Exception:
-        try:
-            proc.terminate()
-        except ProcessLookupError:
-            pass
+        if proc is not None:
+            try:
+                proc.terminate()
+            except ProcessLookupError:
+                pass
 
 
-def kill_process_group(proc: asyncio.subprocess.Process) -> None:
+def kill_process_group(pgid: int, proc: asyncio.subprocess.Process | None = None) -> None:
     try:
-        os.killpg(proc.pid, signal.SIGKILL)
+        os.killpg(pgid, signal.SIGKILL)
     except ProcessLookupError:
         return
     except Exception:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
+        if proc is not None:
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
+
+
+async def terminate_process_group_after_grace(
+    pgid: int,
+    proc: asyncio.subprocess.Process | None,
+    *,
+    grace_s: float,
+) -> None:
+    """TERM a group, then probe the group itself and KILL survivors."""
+    terminate_process_group(pgid, proc)
+    deadline = time.monotonic() + grace_s
+    while process_group_exists(pgid) and time.monotonic() < deadline:
+        interval = min(0.05, max(0.0, deadline - time.monotonic()))
+        await asyncio.sleep(interval)
+    if process_group_exists(pgid):
+        kill_process_group(pgid, proc)
+    if proc is not None and proc.returncode is None:
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=1)
+    kill_deadline = time.monotonic() + 1
+    while process_group_exists(pgid) and time.monotonic() < kill_deadline:
+        await asyncio.sleep(0.01)
 
 
 def shell_command_for_display(parts: Iterable[str]) -> str:
