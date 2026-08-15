@@ -13,6 +13,18 @@ FINDING_FIELDS = ("Evidence:", "Impact:", "Fix:", "Priority:", "Confidence:")
 OPEN_PLACEHOLDER = "{" * 2
 CLOSE_PLACEHOLDER = "}" * 2
 
+# The canonical, accepted finding heading: '### Finding: <neutral summary>'.
+CANONICAL_FINDING_HEADING_RE = re.compile(r"^###\s+Finding:", re.IGNORECASE)
+
+# Loosely recognizes a line that is plausibly *meant* to be a finding heading
+# even when malformed (wrong heading level, numbered, bulleted, bold-only,
+# missing colon, etc.), so a malformed heading no longer hides its block and
+# the block's own field defects from being reported in the same run.
+FINDING_HEADING_CANDIDATE_RE = re.compile(
+    r"^[ \t]*(?:#{1,6}[ \t]*)?(?:[-*+][ \t]+)?(?:\d+[.)][ \t]*)?\**[ \t]*Finding\b.*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 
 def fail(name: str, detail: str) -> str:
     return f"FAIL [{name}]: {detail}"
@@ -33,6 +45,37 @@ def section(text: str, heading: str) -> str:
     )
     match = pattern.search(text)
     return match.group(1).strip() if match else ""
+
+
+def split_finding_blocks(findings: str) -> list[str]:
+    starts = [match.start() for match in FINDING_HEADING_CANDIDATE_RE.finditer(findings)]
+    if not starts:
+        return []
+    starts.append(len(findings))
+    return [findings[starts[i] : starts[i + 1]] for i in range(len(starts) - 1)]
+
+
+def validate_finding_block(block: str, index: int) -> list[str]:
+    failures: list[str] = []
+    heading_line = block.splitlines()[0].strip() if block.splitlines() else ""
+    if not CANONICAL_FINDING_HEADING_RE.match(heading_line):
+        failures.append(
+            fail(
+                "finding_bad_heading",
+                f"finding {index} heading must be exactly '### Finding: <neutral summary>' "
+                f"(found: {heading_line!r})",
+            )
+        )
+    for field in FINDING_FIELDS:
+        if field.lower() not in block.lower():
+            failures.append(fail("finding_missing_field", f"finding {index} is missing {field}"))
+    if "Evidence:" in block and not re.search(r"\b[\w./-]+:\d+\b", block):
+        failures.append(fail("finding_missing_line", f"finding {index} evidence should cite file:line"))
+    if not re.search(r"Priority:\s*P[0-3]\b", block, re.IGNORECASE):
+        failures.append(fail("finding_bad_priority", f"finding {index} priority must be P0, P1, P2, or P3"))
+    if not re.search(r"Confidence:\s*(high|medium|low)\b", block, re.IGNORECASE):
+        failures.append(fail("finding_bad_confidence", f"finding {index} confidence must be high, medium, or low"))
+    return failures
 
 
 def validate_report(path: Path, surface: str) -> list[str]:
@@ -59,20 +102,13 @@ def validate_report(path: Path, surface: str) -> list[str]:
     findings = section(text, "Findings")
     if not findings:
         failures.append(fail("missing_findings_body", "Findings section has no content"))
-    elif re.search(r"^###\s+Finding:", findings, re.IGNORECASE | re.MULTILINE):
-        blocks = re.split(r"(?=^###\s+Finding:)", findings, flags=re.IGNORECASE | re.MULTILINE)
-        for index, block in enumerate([item for item in blocks if item.strip()], start=1):
-            for field in FINDING_FIELDS:
-                if field.lower() not in block.lower():
-                    failures.append(fail("finding_missing_field", f"finding {index} is missing {field}"))
-            if "Evidence:" in block and not re.search(r"\b[\w./-]+:\d+\b", block):
-                failures.append(fail("finding_missing_line", f"finding {index} evidence should cite file:line"))
-            if not re.search(r"Priority:\s*P[0-3]\b", block, re.IGNORECASE):
-                failures.append(fail("finding_bad_priority", f"finding {index} priority must be P0, P1, P2, or P3"))
-            if not re.search(r"Confidence:\s*(high|medium|low)\b", block, re.IGNORECASE):
-                failures.append(fail("finding_bad_confidence", f"finding {index} confidence must be high, medium, or low"))
-    elif "no findings" not in findings.lower():
-        failures.append(fail("findings_not_explicit", "Findings must contain at least one '### Finding:' block or say 'No findings'"))
+    else:
+        blocks = split_finding_blocks(findings)
+        if blocks:
+            for index, block in enumerate(blocks, start=1):
+                failures.extend(validate_finding_block(block, index))
+        elif "no findings" not in findings.lower():
+            failures.append(fail("findings_not_explicit", "Findings must contain at least one '### Finding:' block or say 'No findings'"))
 
     clean = section(text, "Clean")
     if clean and len([line for line in clean.splitlines() if line.strip()]) < 1:

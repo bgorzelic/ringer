@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import datetime
 import io
 import json
 import os
@@ -24,7 +25,9 @@ from ringer import (  # noqa: E402
     TaskSpec,
     artifact_library_path,
     artifact_live_path,
+    html_escape,
     lint_manifest,
+    load_model_identity_registry,
     model_judgment_notes,
     parse_model_notes_sections,
     run_models_command,
@@ -96,6 +99,17 @@ class ScoreboardPageTests(unittest.TestCase):
                 index_out=self.root / "index.html",
             ),
         )
+        # The scoreboard intentionally renders the current generation date.
+        # Pin it here so date assertions are deterministic without constraining
+        # production behavior.
+        class _PatchedDatetime(datetime.datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 7, 6, 0, 0, 0, tzinfo=tz)
+
+        self.datetime_patcher = mock.patch("ringer.datetime", _PatchedDatetime)
+        self.datetime_patcher.start()
+        self.addCleanup(self.datetime_patcher.stop)
         self.write_fixtures()
 
     def restore_env(self) -> None:
@@ -271,7 +285,12 @@ class ScoreboardPageTests(unittest.TestCase):
         self.assertIn("openrouter/proven", html)
         self.assertIn("openrouter/probation", html)
         self.assertIn("openrouter/free:free", html)
-        self.assertIn('<div class="model-name">GPT-5.5</div><div class="model-id">codex</div>', html)
+        registry = load_model_identity_registry()
+        codex_display = registry.resolve("codex", "").model_display
+        self.assertIn(
+            f'<div class="model-name">{html_escape(codex_display)}</div><div class="model-id">codex</div>',
+            html,
+        )
         self.assertIn('<span class="tier-badge proven">proven</span>', html)
         self.assertIn('<span class="tier-badge probation">probation</span>', html)
         self.assertIn("n=20", html)

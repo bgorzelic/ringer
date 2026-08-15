@@ -5,6 +5,7 @@ import argparse
 import asyncio
 import base64
 import contextlib
+import hashlib
 import json
 import mimetypes
 import os
@@ -554,6 +555,8 @@ class Manifest:
         if duplicates:
             raise ValueError(f"duplicate task keys: {', '.join(duplicates)}")
         worktrees = bool(obj.get("worktrees", False))
+        if worktrees and repo is None:
+            raise ValueError("repo is required when worktrees is true")
         if worktrees:
             reserved_logs_dir = (workdir / "logs").resolve()
             collisions = []
@@ -887,6 +890,14 @@ class VerifyResult:
     check_timed_out: bool
     raw_output_excerpt: str
     missing_files: tuple[str, ...] = ()
+    stale_files: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class ExpectedFileFingerprint:
+    size: int
+    sha256: str | None
+    mtime_ns: int
 
 
 class ProcessTree:
@@ -6764,15 +6775,38 @@ def run_models_command(config: AppConfig, args: argparse.Namespace) -> int:
 
 
 class Verifier:
-    async def verify(self, task: TaskSpec, taskdir: Path) -> VerifyResult:
+    async def verify(
+        self,
+        task: TaskSpec,
+        taskdir: Path,
+        expected_files_before: Mapping[str, ExpectedFileFingerprint | None] | None = None,
+    ) -> VerifyResult:
         check_returncode, check_timed_out, output = await self._run_check(task.check, taskdir)
         missing_files = tuple(
             rel for rel in task.expect_files if not self._is_nonempty_file(self._expect_file_path(taskdir, rel))
         )
-        ok = not missing_files and not check_timed_out and check_returncode == 0
+        stale_files = ()
+        if expected_files_before is not None:
+            stale_files = tuple(
+                rel
+                for rel in task.expect_files
+                if rel not in missing_files
+                and expected_files_before.get(rel) is not None
+                and expected_files_before.get(rel)
+                == self._file_fingerprint(self._expect_file_path(taskdir, rel))
+            )
+        ok = not missing_files and not stale_files and not check_timed_out and check_returncode == 0
+        messages = []
         if missing_files:
-            missing_message = f"[ringer] missing expected files: {', '.join(missing_files)}"
-            output = f"{missing_message}\n{output}" if output.strip() else missing_message
+            messages.append(f"[ringer] missing expected files: {', '.join(missing_files)}")
+        if stale_files:
+            messages.append(
+                "[ringer] stale expected files were not created or materially updated "
+                f"by this attempt: {', '.join(stale_files)}"
+            )
+        if messages:
+            prefix = "\n".join(messages)
+            output = f"{prefix}\n{output}" if output.strip() else prefix
         elif not check_timed_out and check_returncode != 0 and not output.strip():
             # A silent failing check wastes the retry (no failure context to
             # inject) and blinds the eval row. Say so, in both places.
@@ -6787,7 +6821,44 @@ class Verifier:
             check_timed_out=check_timed_out,
             raw_output_excerpt=output[:2000],
             missing_files=missing_files,
+            stale_files=stale_files,
         )
+
+    @classmethod
+    def snapshot_expected_files(
+        cls,
+        task: TaskSpec,
+        taskdir: Path,
+    ) -> dict[str, ExpectedFileFingerprint | None]:
+        return {
+            path: cls._file_fingerprint(cls._expect_file_path(taskdir, path))
+            for path in task.expect_files
+        }
+
+    @staticmethod
+    def _file_fingerprint(path: Path) -> ExpectedFileFingerprint | None:
+        try:
+            stat = path.stat()
+            if not path.is_file():
+                return None
+        except OSError:
+            return None
+        try:
+            digest = hashlib.sha256()
+            with path.open("rb") as fh:
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            return ExpectedFileFingerprint(
+                size=stat.st_size,
+                sha256=digest.hexdigest(),
+                mtime_ns=stat.st_mtime_ns,
+            )
+        except OSError:
+            return ExpectedFileFingerprint(
+                size=stat.st_size,
+                sha256=None,
+                mtime_ns=stat.st_mtime_ns,
+            )
 
     @staticmethod
     def _is_nonempty_file(path: Path) -> bool:
@@ -6823,6 +6894,19 @@ class Verifier:
             except asyncio.TimeoutError:
                 kill_process_group(proc)
                 stdout, _ = await proc.communicate()
+        except asyncio.CancelledError:
+            terminate_process_group(proc)
+            try:
+                await asyncio.wait_for(proc.communicate(), timeout=5)
+            except asyncio.TimeoutError:
+                kill_process_group(proc)
+                with contextlib.suppress(Exception):
+                    await proc.communicate()
+            except Exception:
+                kill_process_group(proc)
+                with contextlib.suppress(Exception):
+                    await proc.communicate()
+            raise
         output = stdout.decode("utf-8", errors="replace") if stdout else ""
         if timed_out:
             output += f"\n[ringer.py] check timed out after {CHECK_TIMEOUT_S}s\n"
@@ -6874,36 +6958,53 @@ class RingerRunner:
         self.active_processes: dict[int, asyncio.subprocess.Process] = {}
 
     async def run(self) -> int:
-        self.manifest.workdir.mkdir(parents=True, exist_ok=True)
         final_state = False
+        abnormal_exit = False
+        task_futures: list[asyncio.Task[None]] = []
         try:
+            self.manifest.workdir.mkdir(parents=True, exist_ok=True)
             self.state_writer.start()
             if self.dashboard is not None:
                 self.state_writer.set_port(self.dashboard.start())
-            await asyncio.gather(*(self._run_task(runtime) for runtime in self.runtimes))
+            task_futures = [asyncio.create_task(self._run_task(runtime)) for runtime in self.runtimes]
+            await asyncio.gather(*task_futures)
             final_state = True
             return 0 if all(runtime.status == "pass" for runtime in self.runtimes) else 1
-        except asyncio.CancelledError:
-            await self.kill_all_workers()
-            with self.lock:
-                now = time.monotonic()
-                for runtime in self.runtimes:
-                    if runtime.status not in {"pass", "fail"}:
-                        runtime.status = "fail"
-                        runtime.final_verdict = "ERROR"
-                        runtime.ended_at_monotonic = runtime.ended_at_monotonic or now
-            self.state_writer.flush()
+        except BaseException as exc:
+            abnormal_exit = True
+            for task_future in task_futures:
+                if not task_future.done():
+                    task_future.cancel()
+            if task_futures:
+                with contextlib.suppress(BaseException):
+                    await asyncio.gather(*task_futures, return_exceptions=True)
+            with contextlib.suppress(BaseException):
+                await self.kill_all_workers()
+            reason = (
+                "run cancelled; task stopped before completion"
+                if isinstance(exc, asyncio.CancelledError)
+                else f"runner stopped after unexpected {type(exc).__name__}; task blocked before completion"
+            )
+            self._mark_unfinished_tasks_failed(reason)
+            with contextlib.suppress(Exception):
+                self.state_writer.flush()
             final_state = True
             raise
         finally:
-            if final_state:
-                self.state_writer.finish()
-            self.state_writer.stop()
+            cleanup = contextlib.suppress(BaseException) if abnormal_exit else contextlib.nullcontext()
+            with cleanup:
+                if final_state:
+                    self.state_writer.finish()
+            with cleanup:
+                self.state_writer.stop()
             if self.dashboard is not None:
-                self.dashboard.stop()
-            self.logger.close()
-            print_summary(self.run_id, self.runtimes)
-            print("Model log updated; run './ringer.py models' for the per-model scoreboard.")
+                with cleanup:
+                    self.dashboard.stop()
+            with cleanup:
+                self.logger.close()
+            with cleanup:
+                print_summary(self.run_id, self.runtimes)
+                print("Model log updated; run './ringer.py models' for the per-model scoreboard.")
             # The post-run journey: tell a human exactly where the results live.
             with contextlib.suppress(Exception):
                 if self.state_writer.artifact is not None and self.state_writer.artifact.enabled:
@@ -6916,11 +7017,34 @@ class RingerRunner:
         for proc in procs:
             if proc.returncode is None:
                 terminate_process_group(proc)
-        if procs:
-            await asyncio.sleep(1)
+        pending = [proc for proc in procs if proc.returncode is None]
+        if pending:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*(proc.wait() for proc in pending), return_exceptions=True),
+                    timeout=1,
+                )
+            except asyncio.TimeoutError:
+                for proc in pending:
+                    if proc.returncode is None:
+                        kill_process_group(proc)
+                await asyncio.gather(*(proc.wait() for proc in pending), return_exceptions=True)
         for proc in procs:
-            if proc.returncode is None:
-                kill_process_group(proc)
+            self.active_processes.pop(proc.pid, None)
+
+    def _mark_unfinished_tasks_failed(self, reason: str) -> None:
+        now = time.monotonic()
+        with self.lock:
+            unfinished = [runtime for runtime in self.runtimes if runtime.status not in {"pass", "fail"}]
+            for runtime in unfinished:
+                runtime.status = "fail"
+                runtime.final_verdict = "ERROR"
+                runtime.worker_pid = None
+                runtime.last_check_output = reason
+                runtime.ended_at_monotonic = runtime.ended_at_monotonic or now
+        for runtime in unfinished:
+            with contextlib.suppress(OSError):
+                append_text(runtime.log_path, f"[ringer.py] {reason}\n")
 
     async def _run_task(self, runtime: TaskRuntime) -> None:
         async with self.semaphore:
@@ -6938,13 +7062,21 @@ class RingerRunner:
                     runtime.attempts = attempt
                     runtime.status = "retrying" if retrying else "running"
                 attempt_started = time.monotonic()
+                expected_files_before = self.verifier.snapshot_expected_files(
+                    runtime.task,
+                    runtime.taskdir,
+                )
                 worker = await self._run_worker(runtime, current_spec, attempt)
                 with self.lock:
                     runtime.worker_pid = None
                     runtime.status = "verifying"
                     if worker.tokens is not None:
                         runtime.tokens = (runtime.tokens or 0) + worker.tokens
-                verify = await self.verifier.verify(runtime.task, runtime.taskdir)
+                verify = await self.verifier.verify(
+                    runtime.task,
+                    runtime.taskdir,
+                    expected_files_before,
+                )
                 verdict = verdict_for(worker, verify)
                 with self.lock:
                     runtime.last_check_returncode = verify.check_returncode
@@ -7248,6 +7380,8 @@ class RingerRunner:
             notes_parts.append(f"worker_error={worker.error}")
         if verify.missing_files:
             notes_parts.append(f"missing_expect_files={json.dumps(list(verify.missing_files))}")
+        if verify.stale_files:
+            notes_parts.append(f"stale_expect_files={json.dumps(list(verify.stale_files))}")
         notes_parts.append("raw_check_output_first_2000_chars:")
         notes_parts.append(verify.raw_output_excerpt)
         self.logger.log_attempt(
