@@ -59,6 +59,13 @@ DEFAULT_CATALOG_SOURCE = "https://openrouter.ai/api/v1/models"
 CATALOG_AUTO_REFRESH_MAX_AGE_S = 24 * 60 * 60
 CATALOG_FETCH_TIMEOUT_S = 5
 DEFAULT_TOKEN_REGEX = r"tokens\s+used\s*:?\s*([0-9][0-9,]*)"
+ACCESS_CLASSES = {
+    "subscription",
+    "managed-oauth",
+    "local",
+    "metered",
+    "unavailable",
+}
 CODEX_ENV_ALLOWLIST = (
     "CODEX_HOME",
     "COLORTERM",
@@ -124,6 +131,10 @@ class EngineConfig:
     full_access_args: tuple[str, ...]
     sandbox_args: tuple[str, ...]
     token_regex: str | None = DEFAULT_TOKEN_REGEX
+    # Operator-declared access metadata only. Ringer never derives either
+    # value from a process, environment variable, login, or billing state.
+    access_class: str | None = None
+    access_label: str | None = None
     # Fills the {model} placeholder in args_template when a task does not set
     # its own "model" — this is what makes a harness engine (OpenCode) model
     # agnostic instead of hard-coding one model into the command line.
@@ -286,6 +297,25 @@ def optional_string(value: Any) -> str | None:
     return text or None
 
 
+def optional_plain_string(value: Any, *, key: str) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError(f"{key} must be a string")
+    return optional_string(value)
+
+
+def load_access_class(value: Any, *, key: str) -> str | None:
+    access_class = optional_plain_string(value, key=key)
+    if access_class is None:
+        return None
+    access_class = access_class.lower()
+    if access_class not in ACCESS_CLASSES:
+        allowed = ", ".join(sorted(ACCESS_CLASSES))
+        raise ValueError(f"{key} must be one of: {allowed}")
+    return access_class
+
+
 def as_string_tuple(value: Any, *, key: str) -> tuple[str, ...]:
     if value is None:
         return ()
@@ -415,6 +445,14 @@ def load_engines(raw: Any) -> dict[str, EngineConfig]:
                 re.compile(token_regex, flags=re.IGNORECASE)
             except re.error as exc:
                 raise ValueError(f"engines.{clean_name}.token_regex is invalid: {exc}") from exc
+        access_class = load_access_class(
+            section.get("access_class"),
+            key=f"engines.{clean_name}.access_class",
+        )
+        access_label = optional_plain_string(
+            section.get("access_label"),
+            key=f"engines.{clean_name}.access_label",
+        )
         model_default = str(
             section.get("model_default", base.model_default if base else "")
         ).strip()
@@ -441,6 +479,8 @@ def load_engines(raw: Any) -> dict[str, EngineConfig]:
             full_access_args=full_access_args,
             sandbox_args=sandbox_args,
             token_regex=token_regex,
+            access_class=access_class,
+            access_label=access_label,
             model_default=model_default,
             env_allowlist=env_allowlist,
             preflight_executables=preflight_executables,
@@ -972,7 +1012,14 @@ class TaskRuntime:
     started_at_monotonic: float | None = None
     ended_at_monotonic: float | None = None
     worker_pid: int | None = None
+    # `tokens` is populated only when the total is exact. The known subtotal
+    # and attempt counters preserve partial and fully unknown accounting.
     tokens: int | None = None
+    token_known_total: int = 0
+    token_attempts: int = 0
+    token_known_attempts: int = 0
+    token_unknown_attempts: int = 0
+    blocked_reason: str | None = None
     final_verdict: str | None = None
     last_check_returncode: int | None = None
     last_check_timed_out: bool = False
@@ -984,6 +1031,86 @@ class TaskRuntime:
         end = self.ended_at_monotonic if self.ended_at_monotonic is not None else now
         return max(0.0, end - self.started_at_monotonic)
 
+    def record_tokens(self, value: int | None) -> None:
+        self.token_attempts += 1
+        if value is None:
+            self.token_unknown_attempts += 1
+        else:
+            self.token_known_attempts += 1
+            self.token_known_total += value
+        self.tokens = (
+            self.token_known_total
+            if self.token_known_attempts > 0 and self.token_unknown_attempts == 0
+            else None
+        )
+
+
+def task_token_accounting(runtime: TaskRuntime) -> dict[str, Any]:
+    if runtime.token_attempts == 0 and runtime.tokens is not None:
+        # Preserve exact totals on manually constructed/older runtimes that
+        # predate attempt counters.
+        return {
+            "tokens": runtime.tokens,
+            "tokens_known_total": runtime.tokens,
+            "tokens_exact": True,
+            "tokens_partial": False,
+            "tokens_unknown": False,
+            "token_attempts": runtime.attempts,
+            "token_known_attempts": runtime.attempts,
+            "token_unknown_attempts": 0,
+            "token_pending_attempts": 0,
+        }
+    known_total = runtime.token_known_total if runtime.token_known_attempts > 0 else None
+    pending_attempts = max(0, runtime.attempts - runtime.token_attempts)
+    exact = (
+        runtime.token_attempts > 0
+        and runtime.token_unknown_attempts == 0
+        and pending_attempts == 0
+    )
+    partial = runtime.token_known_attempts > 0 and (
+        runtime.token_unknown_attempts > 0 or pending_attempts > 0
+    )
+    return {
+        "tokens": runtime.token_known_total if exact else None,
+        "tokens_known_total": known_total,
+        "tokens_exact": exact,
+        "tokens_partial": partial,
+        "tokens_unknown": not exact and not partial,
+        "token_attempts": runtime.token_attempts,
+        "token_known_attempts": runtime.token_known_attempts,
+        "token_unknown_attempts": runtime.token_unknown_attempts,
+        "token_pending_attempts": pending_attempts,
+    }
+
+
+def run_token_accounting(runtimes: Iterable[TaskRuntime]) -> dict[str, Any]:
+    task_accounts = [task_token_accounting(runtime) for runtime in runtimes]
+    known_totals = [
+        int(account["tokens_known_total"])
+        for account in task_accounts
+        if account["tokens_known_total"] is not None
+    ]
+    known_total = sum(known_totals) if known_totals else None
+    exact = bool(task_accounts) and all(bool(account["tokens_exact"]) for account in task_accounts)
+    partial = bool(known_totals) and not exact
+    return {
+        "tokens": sum(known_totals) if exact else None,
+        "tokens_known_total": known_total,
+        "tokens_exact": exact,
+        "tokens_partial": partial,
+        "tokens_unknown": not exact and not partial,
+        "token_attempts": sum(int(account["token_attempts"]) for account in task_accounts),
+        "token_known_attempts": sum(
+            int(account["token_known_attempts"]) for account in task_accounts
+        ),
+        "token_unknown_attempts": sum(
+            int(account["token_unknown_attempts"]) for account in task_accounts
+        ),
+        "token_pending_attempts": sum(
+            int(account["token_pending_attempts"]) for account in task_accounts
+        ),
+    }
+
 
 @dataclass(frozen=True)
 class WorkerResult:
@@ -991,6 +1118,7 @@ class WorkerResult:
     timed_out: bool
     tokens: int | None
     error: str | None = None
+    error_kind: str | None = None
 
 
 @dataclass(frozen=True)
@@ -1091,7 +1219,7 @@ class StateWriter:
         self.pid = os.getpid()
         self.port: int | None = None
         self.finished = False
-        self.summary: dict[str, int] | None = None
+        self.summary: dict[str, Any] | None = None
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.artifact = artifact or ArtifactConfig(
@@ -1158,6 +1286,7 @@ class StateWriter:
                 log_tail_full = tail_lines(runtime.log_path, line_count=40)
                 engine = self.engines.get(runtime.task.engine)
                 process_name = engine.process_name if engine else runtime.task.engine
+                token_accounting = task_token_accounting(runtime)
                 tasks.append(
                     {
                         "key": runtime.task.key,
@@ -1165,6 +1294,8 @@ class StateWriter:
                         "verdict": runtime.final_verdict,
                         "engine": runtime.task.engine,
                         "model": runtime.task.model or (engine.model_default if engine else ""),
+                        "access_class": engine.access_class if engine else None,
+                        "access_label": engine.access_label if engine else None,
                         "spec": runtime.task.spec,
                         "spec_short": runtime.spec_short,
                         "verified": runtime.task.verified,
@@ -1182,8 +1313,9 @@ class StateWriter:
                         "deliverable_notes": list(runtime.deliverable_notes),
                         "activity": worker_activity(runtime.log_path, log_tail),
                         "elapsed_s": round(runtime.elapsed_s(now), 1),
-                        "tokens": runtime.tokens,
+                        **token_accounting,
                         "attempts": runtime.attempts,
+                        "blocked_reason": runtime.blocked_reason,
                         "children": ProcessTree.count_named_descendants(
                             runtime.worker_pid, children, commands, process_name
                         ),
@@ -1196,12 +1328,21 @@ class StateWriter:
             running_count = sum(
                 1 for item in tasks if item["status"] in {"running", "verifying", "retrying"}
             )
+            token_accounting = run_token_accounting(self.runtimes)
             totals = {
                 "running": running_count,
                 "done": pass_count + fail_count,
                 "pass": pass_count,
                 "fail": fail_count,
-                "tokens": sum(int(item["tokens"] or 0) for item in tasks),
+                **token_accounting,
+            }
+            configured_access = {
+                name: {
+                    "access_class": self.engines[name].access_class,
+                    "access_label": self.engines[name].access_label,
+                }
+                for name in sorted({runtime.task.engine for runtime in self.runtimes})
+                if name in self.engines
             }
             return {
                 "run_id": self.run_id,
@@ -1214,6 +1355,7 @@ class StateWriter:
                 "max_parallel": self.max_parallel,
                 "finished": self.finished,
                 "summary": self.summary if self.finished else None,
+                "configured_access": configured_access,
                 "started_at": self.started_at.isoformat(),
                 "elapsed_s": max((float(item["elapsed_s"]) for item in tasks), default=0.0),
                 "tasks": tasks,
@@ -1221,18 +1363,22 @@ class StateWriter:
                 "pass": totals["pass"],
                 "fail": totals["fail"],
                 "tokens": totals["tokens"],
+                "tokens_known_total": totals["tokens_known_total"],
+                "tokens_exact": totals["tokens_exact"],
+                "tokens_partial": totals["tokens_partial"],
+                "tokens_unknown": totals["tokens_unknown"],
                 "artifact_path": str(self.artifact_path) if self.artifact.enabled else None,
                 "live_path": str(self.live_path) if self.artifact.enabled else None,
                 "report_path": str(self.report_path) if self.artifact.enabled else None,
                 "report_ready": self.report_written,
             }
 
-    def build_summary(self) -> dict[str, int]:
+    def build_summary(self) -> dict[str, Any]:
         with self.lock:
             return {
                 "pass": sum(1 for runtime in self.runtimes if runtime.status == "pass"),
                 "fail": sum(1 for runtime in self.runtimes if runtime.status == "fail"),
-                "tokens": sum(int(runtime.tokens or 0) for runtime in self.runtimes),
+                **run_token_accounting(self.runtimes),
             }
 
     def _write_status_artifact_safe(self, state: dict[str, Any]) -> None:
@@ -1883,7 +2029,10 @@ def start_catalog_auto_refresh(
 
 
 def proven_model_group(group: dict[str, Any]) -> bool:
-    return int(group.get("tasks") or 0) >= 3 and float(group.get("first_try_pass_rate") or 0) >= 0.67
+    return model_scoreboard_tier(
+        int(group.get("tasks") or 0),
+        float(group.get("first_try_pass_rate") or 0),
+    ) == "proven"
 
 
 def catalog_model_is_text_candidate(model: dict[str, Any]) -> bool:
@@ -3467,6 +3616,25 @@ def render_work_group(
         page_path=page_path,
     )
 
+    attempts = int(task.get("attempts") or 0)
+    attempt_word = "attempt" if attempts == 1 else "attempts"
+    accountability_parts = [f"Attempts: {attempts} {attempt_word}"]
+    if bucket == "pass" and attempts > 1:
+        accountability_parts.append("Passed after retry")
+    accountability_parts.append(f"Tokens: {token_accounting_text(task)}")
+    accountability_parts.append(
+        "Configured access: "
+        + access_accounting_text(task.get("access_class"), task.get("access_label"))
+    )
+    blocked_reason = str(task.get("blocked_reason") or "").strip()
+    if blocked_reason:
+        accountability_parts.append(f"Blocked: {blocked_reason}")
+    accountability_html = (
+        '<span class="verified accountability">'
+        + html_escape(" · ".join(accountability_parts))
+        + "</span>"
+    )
+
     return f"""<div class="work-group">
       <div class="worker">
         <span class="glyph {css_bucket}" aria-hidden="true"></span>
@@ -3477,6 +3645,7 @@ def render_work_group(
       </div>
       <div class="work-group-body">
         {items_html}
+        {accountability_html}
         {verified_html}
         <span class="links">{links_html}</span>
       </div>
@@ -3686,6 +3855,7 @@ def render_final_report_html(
   {render_corner_header(state, live=False)}
   <h1 id="what-happened-heading" class="briefing">What happened — {briefing}</h1>
   {render_progress_bar(tasks, counts)}
+  {render_run_accountability(state)}
   {render_work_section(state, renderer=renderer, page_path=page_path, force_wrappers=force_wrappers, primary=True)}
   <footer>
     <span class="mono">Finished {html_escape(local_time_label())}</span>
@@ -3694,6 +3864,48 @@ def render_final_report_html(
 </body>
 </html>
 """
+
+
+def token_accounting_text(account: Mapping[str, Any]) -> str:
+    known_total = account.get("tokens_known_total")
+    if bool(account.get("tokens_exact")):
+        exact_total = account.get("tokens")
+        if exact_total is None:
+            exact_total = known_total
+        return f"{int(exact_total or 0):,} exact"
+    if bool(account.get("tokens_partial")):
+        return f"partial ({int(known_total or 0):,} known; at least one attempt unknown)"
+    legacy_total = account.get("tokens")
+    if "tokens_exact" not in account and legacy_total is not None:
+        return f"{int(legacy_total):,} exact"
+    return "unknown"
+
+
+def access_accounting_text(access_class: Any, access_label: Any) -> str:
+    class_text = str(access_class or "unknown/unset")
+    label_text = str(access_label or "").strip()
+    return f"{class_text} ({label_text})" if label_text else class_text
+
+
+def render_run_accountability(state: dict[str, Any]) -> str:
+    access = state.get("configured_access")
+    access_parts: list[str] = []
+    if isinstance(access, dict):
+        for engine_name in sorted(access):
+            item = access.get(engine_name)
+            if not isinstance(item, dict):
+                continue
+            access_parts.append(
+                f"{engine_name}: "
+                f"{access_accounting_text(item.get('access_class'), item.get('access_label'))}"
+            )
+    access_text = "; ".join(access_parts) if access_parts else "unknown/unset"
+    token_text = token_accounting_text(state.get("totals") or state)
+    return (
+        '<p class="legend accountability-run">'
+        f"Token accounting: {html_escape(token_text)} &middot; "
+        f"Configured access: {html_escape(access_text)}</p>"
+    )
 
 
 def task_activity_line(task: dict[str, Any], bucket: str) -> str:
@@ -4494,7 +4706,7 @@ class Dashboard:
                     try:
                         body = state_path.read_bytes()
                     except FileNotFoundError:
-                        body = b'{"run_name":"ringer","identity":"unknown","started_at":"","port":null,"dashboard_port":null,"tasks":[],"totals":{"running":0,"done":0,"pass":0,"fail":0,"tokens":0}}'
+                        body = b'{"run_name":"ringer","identity":"unknown","started_at":"","port":null,"dashboard_port":null,"tasks":[],"totals":{"running":0,"done":0,"pass":0,"fail":0,"tokens":null,"tokens_known_total":null,"tokens_exact":false,"tokens_partial":false,"tokens_unknown":true}}'
                     send_response_body(
                         self,
                         HTTPStatus.OK,
@@ -5847,8 +6059,8 @@ def catalog_models_by_id(catalog_models: list[dict[str, Any]]) -> dict[str, dict
     return by_id
 
 
-def model_scoreboard_tier(tasks: int) -> str:
-    if tasks >= 3:
+def model_scoreboard_tier(tasks: int, first_try_pass_rate: float) -> str:
+    if tasks >= 3 and first_try_pass_rate >= 0.67:
         return "proven"
     return "probation"
 
@@ -5947,7 +6159,10 @@ def aggregate_model_scoreboard_rows(
                 }
             )
         breakdown_rows.sort(key=lambda item: (-item["tasks"], item["task_type"]))
-        tier = model_scoreboard_tier(tasks_count)
+        first_try_pass_rate = (
+            entry["first_try_passed"] / tasks_count if tasks_count else 0.0
+        )
+        tier = model_scoreboard_tier(tasks_count, first_try_pass_rate)
         finalized.append(
             {
                 "model": entry["model"],
@@ -5957,7 +6172,7 @@ def aggregate_model_scoreboard_rows(
                 "retries": entry["retries"],
                 "passed": entry["passed"],
                 "failed": entry["failed"],
-                "first_try_pass_rate": entry["first_try_passed"] / tasks_count if tasks_count else 0.0,
+                "first_try_pass_rate": first_try_pass_rate,
                 "pass_rate": entry["passed"] / tasks_count if tasks_count else 0.0,
                 "median_duration_ms": median_int(entry["_duration_ms"]),
                 "median_tokens": median_int(entry["_tokens"]),
@@ -7173,6 +7388,9 @@ class RingerRunner:
                 runtime.final_verdict = "ERROR"
                 runtime.worker_pid = None
                 runtime.last_check_output = reason
+                runtime.blocked_reason = "Runner stopped before task completion."
+                while runtime.token_attempts < runtime.attempts:
+                    runtime.record_tokens(None)
                 runtime.ended_at_monotonic = runtime.ended_at_monotonic or now
         for runtime in unfinished:
             with contextlib.suppress(OSError):
@@ -7202,8 +7420,9 @@ class RingerRunner:
                 with self.lock:
                     runtime.worker_pid = None
                     runtime.status = "verifying"
-                    if worker.tokens is not None:
-                        runtime.tokens = (runtime.tokens or 0) + worker.tokens
+                    runtime.record_tokens(worker.tokens)
+                    if worker.error:
+                        runtime.blocked_reason = worker_blocked_reason(worker.error_kind)
                 verify = await self.verifier.verify(
                     runtime.task,
                     runtime.taskdir,
@@ -7309,28 +7528,37 @@ class RingerRunner:
     async def _prepare_taskdir(self, runtime: TaskRuntime) -> tuple[bool, str | None]:
         taskdir = runtime.taskdir
         if self.manifest.worktrees and self.manifest.repo is not None:
-            taskdir.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                taskdir.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                return False, str(exc)
             if taskdir.exists():
                 return False, f"worktree taskdir already exists: {taskdir}"
-            proc = await asyncio.create_subprocess_exec(
-                "git",
-                "-C",
-                str(self.manifest.repo),
-                "worktree",
-                "add",
-                str(taskdir),
-                "HEAD",
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
+            try:
+                proc = await asyncio.create_subprocess_exec(
+                    "git",
+                    "-C",
+                    str(self.manifest.repo),
+                    "worktree",
+                    "add",
+                    str(taskdir),
+                    "HEAD",
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+            except OSError as exc:
+                return False, str(exc)
             stdout, _ = await proc.communicate()
             if proc.returncode != 0:
                 message = stdout.decode("utf-8", errors="replace")
                 append_text(runtime.log_path, f"[ringer.py] git worktree add failed:\n{message}\n")
                 return False, message.strip() or "git worktree add failed"
             return True, None
-        taskdir.mkdir(parents=True, exist_ok=True)
+        try:
+            taskdir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            return False, str(exc)
         return True, None
 
     async def _cleanup_worktree_on_pass(self, runtime: TaskRuntime) -> None:
@@ -7381,6 +7609,8 @@ class RingerRunner:
             runtime.attempts = 1
             runtime.status = "fail"
             runtime.final_verdict = "ERROR"
+            runtime.blocked_reason = "Task preparation failed."
+            runtime.record_tokens(None)
             runtime.ended_at_monotonic = time.monotonic()
         verify = VerifyResult(
             ok=False,
@@ -7400,6 +7630,7 @@ class RingerRunner:
                 timed_out=False,
                 tokens=None,
                 error=f"unknown worker engine: {runtime.task.engine}",
+                error_kind="configuration",
             )
         if runtime.task.full_access and not self.config.allow_full_access:
             return WorkerResult(
@@ -7410,6 +7641,7 @@ class RingerRunner:
                     f"task requested full_access with engine {runtime.task.engine}, "
                     "but config allow_full_access is false"
                 ),
+                error_kind="configuration",
             )
         cmd = build_worker_command(
             engine,
@@ -7430,7 +7662,13 @@ class RingerRunner:
         try:
             log_fh = log_path.open("ab")
         except OSError as exc:
-            return WorkerResult(returncode=None, timed_out=False, tokens=None, error=str(exc))
+            return WorkerResult(
+                returncode=None,
+                timed_out=False,
+                tokens=None,
+                error=str(exc),
+                error_kind="preparation",
+            )
         async with AsyncFileCloser(log_fh):
             try:
                 proc = await asyncio.create_subprocess_exec(
@@ -7446,7 +7684,13 @@ class RingerRunner:
                 message = f"[ringer.py] worker spawn failed: {exc}\n"
                 log_fh.write(message.encode("utf-8", errors="replace"))
                 log_fh.flush()
-                return WorkerResult(returncode=None, timed_out=False, tokens=None, error=str(exc))
+                return WorkerResult(
+                    returncode=None,
+                    timed_out=False,
+                    tokens=None,
+                    error=str(exc),
+                    error_kind="spawn",
+                )
             with self.lock:
                 runtime.worker_pid = proc.pid
             pgid = proc.pid
@@ -7615,6 +7859,14 @@ def verdict_for(worker: WorkerResult, verify: VerifyResult) -> str:
     if worker.returncode == 0 and verify.ok:
         return "PASS"
     return "FAIL"
+
+
+def worker_blocked_reason(error_kind: str | None) -> str:
+    return {
+        "configuration": "Worker configuration prevented this task from starting.",
+        "preparation": "Worker preparation failed.",
+        "spawn": "Worker process could not be started.",
+    }.get(error_kind, "Runner failed before the worker could complete.")
 
 
 def build_run_id(run_name: str) -> str:
@@ -8195,7 +8447,13 @@ def print_summary(run_id: str, runtimes: list[TaskRuntime]) -> None:
     print("-" * len(header))
     now = time.monotonic()
     for runtime in runtimes:
-        tokens = "" if runtime.tokens is None else str(runtime.tokens)
+        token_account = task_token_accounting(runtime)
+        if token_account["tokens_exact"]:
+            tokens = str(token_account["tokens"])
+        elif token_account["tokens_partial"]:
+            tokens = f"{token_account['tokens_known_total']}+?"
+        else:
+            tokens = "unknown"
         print(
             f"{runtime.task.key:<24} {runtime.status:<8} "
             f"{(runtime.final_verdict or ''):<8} {runtime.attempts:>8} "

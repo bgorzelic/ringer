@@ -110,20 +110,20 @@ class RingsideAccountabilityTests(unittest.TestCase):
         self.assertIn("return value === null || value === undefined || value === \"\";", self.script)
 
     def test_task_tokens_render_unknown_label_when_missing(self) -> None:
-        self.assertIn('function formatTokens(value, unknown) {\n      if (unknown) return "tok unknown";', self.script)
+        self.assertIn('function formatTokens(value, unknown, partial) {\n      if (unknown) return "tok unknown";', self.script)
         update_fn = self._extract_function("updateTaskRecord")
-        self.assertIn("const tokensUnknown = isUnknownAmount(task.tokens);", update_fn)
-        self.assertIn("formatTokens(tokens, tokensUnknown)", update_fn)
+        self.assertIn("const tokensUnknown = isTokensUnknown(task, task.tokens);", update_fn)
+        self.assertIn("formatTokens(tokens, tokensUnknown, tokensPartial)", update_fn)
 
     def test_run_totals_render_unknown_label_when_missing(self) -> None:
         normalize_fn = self._extract_function("normalizePayload")
         self.assertIn("passUnknown: isUnknownAmount(rawPass),", normalize_fn)
         self.assertIn("failUnknown: isUnknownAmount(rawFail),", normalize_fn)
-        self.assertIn("tokensUnknown: isUnknownAmount(rawTokens),", normalize_fn)
+        self.assertIn("tokensUnknown: isTokensUnknown(run, rawTokens),", normalize_fn)
         update_run_fn = self._extract_function("updateRunRecord")
         self.assertIn("formatCount(run.pass, run.passUnknown)", update_run_fn)
         self.assertIn("formatCount(run.fail, run.failUnknown)", update_run_fn)
-        self.assertIn("formatTokens(run.tokens, run.tokensUnknown)", update_run_fn)
+        self.assertIn("formatTokens(run.tokens, run.tokensUnknown, run.tokensPartial)", update_run_fn)
 
     def test_format_count_never_prints_zero_for_unknown(self) -> None:
         self.assertIn(

@@ -102,7 +102,8 @@ class HudModelsTabTests(unittest.TestCase):
         rollup = payload["rollup"][0]
         self.assertEqual("openrouter/acme/small", rollup["model"])
         self.assertEqual("acme/small", rollup["model_display"])
-        self.assertEqual("proven", rollup["tier"])
+        # 2/3 is below the explicit 0.67 policy threshold.
+        self.assertEqual("probation", rollup["tier"])
         self.assertEqual(3, rollup["tasks"])
         self.assertEqual(4, rollup["attempts"])
         self.assertEqual(1.0, rollup["pass_rate"])

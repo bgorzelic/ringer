@@ -1167,13 +1167,24 @@
       return `${count} ${count === 1 ? singular : pluralName}`;
     }
 
-    function formatTokens(value, unknown) {
+    function formatTokens(value, unknown, partial) {
       if (unknown) return "tok unknown";
-      return `${numberOrZero(value).toLocaleString()} tok`;
+      const text = `${numberOrZero(value).toLocaleString()} tok`;
+      return partial ? `${text} (partial)` : text;
     }
 
     function formatCount(value, unknown) {
       return unknown ? "unknown" : String(numberOrZero(value));
+    }
+
+    // Legacy payloads never sent tokens_unknown/tokens_partial: an absent flag falls
+    // back to the old null/undefined/empty check so older Ringer servers still render.
+    function isTokensUnknown(source, rawValue) {
+      return source?.tokens_unknown === true || isUnknownAmount(rawValue);
+    }
+
+    function isTokensPartial(source, rawValue) {
+      return source?.tokens_partial === true && !isTokensUnknown(source, rawValue);
     }
 
     // Optional forward-compatible metadata: absent means "not reported yet" (render
@@ -1186,7 +1197,10 @@
     }
 
     function accessLabel(source) {
-      return optionalMetaLabel(source?.access_class !== undefined ? source.access_class : source?.access);
+      const base = optionalMetaLabel(source?.access_class !== undefined ? source.access_class : source?.access);
+      if (base === null) return null;
+      const label = String(source?.access_label ?? "").trim();
+      return label ? `${base} — ${label}` : base;
     }
 
     function blockedReasonLabel(task) {
@@ -1248,7 +1262,8 @@
           tokens,
           passUnknown: isUnknownAmount(rawPass),
           failUnknown: isUnknownAmount(rawFail),
-          tokensUnknown: isUnknownAmount(rawTokens),
+          tokensUnknown: isTokensUnknown(run, rawTokens),
+          tokensPartial: isTokensPartial(run, rawTokens),
           tasks: Array.isArray(run.tasks) ? run.tasks : []
         };
       }).sort((left, right) => {
@@ -1630,7 +1645,8 @@
     function updateTaskRecord(record, task, run, runRecord) {
       const status = task.status || "queued";
       const tail = taskTailText(task);
-      const tokensUnknown = isUnknownAmount(task.tokens);
+      const tokensUnknown = isTokensUnknown(task, task.tokens);
+      const tokensPartial = isTokensPartial(task, task.tokens);
       const tokens = numberOrZero(task.tokens);
       const children = numberOrZero(task.children);
       const attempts = numberOrZero(task.attempts);
@@ -1653,7 +1669,7 @@
       setText(record.elements.activity, activity);
       setTitle(record.elements.activity, activity);
       setText(record.elements.elapsed, fmtElapsed(task.elapsed_s));
-      setText(record.elements.tokens, formatTokens(tokens, tokensUnknown));
+      setText(record.elements.tokens, formatTokens(tokens, tokensUnknown, tokensPartial));
       setText(record.elements.children, children > 0 ? `p${children}` : "");
       setText(record.elements.retry, attempts > 1 ? (passedAfterRetry ? `passed after retry ×${attempts}` : `retry ×${attempts}`) : "");
       setHidden(record.elements.access, taskAccess === null);
@@ -1815,7 +1831,7 @@
       setHidden(record.elements.access, runAccess === null);
       setText(record.elements.access, runAccess ? `access ${runAccess}` : "");
       setText(record.elements.elapsed, fmtElapsed(run.elapsed_s));
-      setText(record.elements.tokens, formatTokens(run.tokens, run.tokensUnknown));
+      setText(record.elements.tokens, formatTokens(run.tokens, run.tokensUnknown, run.tokensPartial));
       setText(record.elements.final, final);
       syncTaskNodes(record, run.tasks, run);
     }
@@ -1943,6 +1959,21 @@
       return `${Math.round(number * 100)}%`;
     }
 
+    // The server's row.tier is advisory only: the dashboard never labels a model
+    // "proven" on trust alone, so it recomputes the tier locally from the same
+    // task-count and first-try numbers the row already carries.
+    const PROVEN_MIN_TASKS = 3;
+    const PROVEN_MIN_FIRST_TRY_PASS_RATE = 0.67;
+
+    function localTier(row) {
+      const tasks = numberOrZero(row?.tasks);
+      const firstTryPassRate = Number(row?.first_try_pass_rate);
+      const proven = tasks >= PROVEN_MIN_TASKS
+        && Number.isFinite(firstTryPassRate)
+        && firstTryPassRate >= PROVEN_MIN_FIRST_TRY_PASS_RATE;
+      return proven ? "proven" : "probation";
+    }
+
     function formatModelDate(value) {
       const text = String(value || "").trim();
       if (!text) return "unknown";
@@ -2014,7 +2045,7 @@
         const expanded = expandedModelKey === key;
         const display = String(row.model_display || row.model || "unknown");
         const slug = String(row.model || "unknown");
-        const tier = safeClass(row.tier, "unknown");
+        const tier = localTier(row);
         body.push(
           `<tr class="model-row${expanded ? " expanded" : ""}" data-model="${escapeHtml(key)}" tabindex="0">`,
           `<td class="numeric">${index + 1}</td>`,
@@ -2026,7 +2057,7 @@
           '</td>',
           `<td>${escapeHtml(row.harness || "unknown")}</td>`,
           `<td>${escapeHtml(row.access || "unknown")}</td>`,
-          `<td><span class="tier-badge ${escapeHtml(tier)}">${escapeHtml(row.tier || "unknown")}</span></td>`,
+          `<td><span class="tier-badge ${escapeHtml(tier)}">${escapeHtml(tier)}</span></td>`,
           `<td class="numeric">${numberOrZero(row.tasks).toLocaleString()}</td>`,
           `<td class="numeric">${escapeHtml(formatModelPercent(row.first_try_pass_rate))}</td>`,
           `<td class="numeric">${escapeHtml(formatModelPercent(row.pass_rate))}</td>`,
