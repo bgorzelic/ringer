@@ -168,7 +168,7 @@ class ModelDbTests(unittest.TestCase):
         )
 
     def count_attempts(self) -> int:
-        with sqlite3.connect(self.db_path) as conn:
+        with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
             return int(conn.execute("SELECT COUNT(*) FROM attempts").fetchone()[0])
 
     def test_schema_creation_uses_wal_mode(self) -> None:
@@ -210,7 +210,7 @@ class ModelDbTests(unittest.TestCase):
         self.assertEqual(1, result.skipped)
         self.assertEqual(2, second.attempts_inserted)
         self.assertEqual(2, self.count_attempts())
-        with sqlite3.connect(self.db_path) as conn:
+        with contextlib.closing(sqlite3.connect(self.db_path)) as conn:
             self.assertEqual(1, conn.execute("SELECT COUNT(*) FROM catalog_models").fetchone()[0])
             self.assertEqual(2, conn.execute("SELECT COUNT(*) FROM identity").fetchone()[0])
 
