@@ -1,0 +1,2 @@
+# Optional standards validator. Ringer falls back to the standard library when absent.
+jsonschema[format-nongpl]>=4.18,<5

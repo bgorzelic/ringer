@@ -111,7 +111,15 @@ Not sure what your tasks even are yet? [`docs/interview-prompt.md`](docs/intervi
 
 ## Lint
 
-Lint checks a manifest for the mistakes that make swarms hard to trust: checks that cannot fail, silent checks, worktree deliverables that disappear, worker commits that die with deleted worktrees, serial fan-out, write collisions, and underspecified specs.
+Every manifest loaded from disk is first checked against the bundled JSON Schema Draft 2020-12 contract in [`schemas/manifest.schema.json`](schemas/manifest.schema.json). Ringer uses its standard-library validator by default, with no network access or required packages. Install the optional standards implementation when authoring or validating manifests:
+
+```bash
+python3 -m pip install -r requirements-schema.txt
+```
+
+When installed, `jsonschema`'s `Draft202012Validator` validates the same bundled schema. Invalid or unknown fields stop `lint`, `run`, and `demo` before any worker starts. A missing optional package selects the standard-library fallback; a broken partial installation raises an explicit error instead of silently weakening validation.
+
+After schema validation, lint checks a manifest for the mistakes that make swarms hard to trust: checks that cannot fail, silent checks, worktree deliverables that disappear, worker commits that die with deleted worktrees, serial fan-out, write collisions, and underspecified specs.
 
 ```bash
 ./ringer.py lint templates/review-swarm.json

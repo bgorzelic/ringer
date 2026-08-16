@@ -43,6 +43,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Iterable, Literal, Mapping
 
+from manifest_validation import validate_manifest_data
+
 
 TOOL_NAME = "ringer"
 STATE_DIR_NAME = ".ringer"
@@ -594,8 +596,7 @@ class Manifest:
     @classmethod
     def from_path(cls, path: Path) -> "Manifest":
         data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            raise ValueError("manifest root must be a JSON object")
+        validate_manifest_data(data)
         manifest = cls.from_obj(data)
         return cls(
             run_name=manifest.run_name,
