@@ -108,6 +108,7 @@ class ModelPlaceholderTests(unittest.TestCase):
                     "args_template": ["opencode", "run", "{spec}"],
                     "env_allowlist": ["PATH", "OPENROUTER_BASE_URL"],
                     "preflight_executables": ["opencode"],
+                    "worker_executable": "opencode",
                 }
             }
         )
@@ -116,6 +117,7 @@ class ModelPlaceholderTests(unittest.TestCase):
             engines["harness"].env_allowlist,
         )
         self.assertEqual(("opencode",), engines["harness"].preflight_executables)
+        self.assertEqual("opencode", engines["harness"].worker_executable)
 
     def test_codex_override_inherits_secure_runtime_defaults(self) -> None:
         default = load_engines(None)["codex"]
@@ -243,12 +245,13 @@ class ModelValidationTests(unittest.TestCase):
             token_regex=None,
             env_allowlist=("PATH",),
             preflight_executables=("ringer-definitely-missing-worker",),
+            worker_executable="ringer-definitely-missing-worker",
         )
         config = self.config({"wrapped": wrapped})
         manifest = self.manifest(self.base_task(engine="wrapped"))
         with self.assertRaisesRegex(
             ValueError,
-            "preflight executable not found.*ringer-definitely-missing-worker",
+            "worker executable not found.*ringer-definitely-missing-worker",
         ):
             preflight_engine_bins(manifest, config)
 
@@ -264,8 +267,88 @@ class ModelValidationTests(unittest.TestCase):
         )
         config = self.config({"wrapped": undeclared})
         manifest = self.manifest(self.base_task(engine="wrapped"))
-        with self.assertRaisesRegex(ValueError, "must declare.*preflight_executables"):
+        with self.assertRaisesRegex(ValueError, "must declare.*worker_executable"):
             preflight_engine_bins(manifest, config)
+
+    def test_preflight_env_child_matches_declaration_after_supported_flags(self) -> None:
+        wrapped = EngineConfig(
+            name="wrapped",
+            bin="/usr/bin/env",
+            args_template=(
+                "-i",
+                "-u",
+                "IGNORED",
+                "-P",
+                str(Path(sys.executable).parent),
+                "--",
+                Path(sys.executable).name,
+                "{spec}",
+            ),
+            full_access_args=(),
+            sandbox_args=(),
+            token_regex=None,
+            env_allowlist=("PATH",),
+            worker_executable=sys.executable,
+        )
+        preflight_engine_bins(
+            self.manifest(self.base_task(engine="wrapped")),
+            self.config({"wrapped": wrapped}),
+        )
+
+    def test_preflight_rejects_env_child_declaration_mismatch(self) -> None:
+        wrapped = EngineConfig(
+            name="wrapped",
+            bin="/usr/bin/env",
+            args_template=(sys.executable, "{spec}"),
+            full_access_args=(),
+            sandbox_args=(),
+            token_regex=None,
+            env_allowlist=("PATH",),
+            worker_executable="/bin/sh",
+        )
+        with self.assertRaisesRegex(ValueError, "worker executable mismatch"):
+            preflight_engine_bins(
+                self.manifest(self.base_task(engine="wrapped")),
+                self.config({"wrapped": wrapped}),
+            )
+
+    def test_preflight_direct_executable_is_bound_to_bin(self) -> None:
+        direct = EngineConfig(
+            name="direct",
+            bin=sys.executable,
+            args_template=("{spec}",),
+            full_access_args=(),
+            sandbox_args=(),
+            token_regex=None,
+            worker_executable="/bin/sh",
+        )
+        with self.assertRaisesRegex(ValueError, "worker executable mismatch"):
+            preflight_engine_bins(
+                self.manifest(self.base_task(engine="direct")),
+                self.config({"direct": direct}),
+            )
+
+    def test_extra_python_preflight_cannot_hide_missing_env_child(self) -> None:
+        missing_child = "ringer-definitely-missing-launched-child"
+        wrapped = EngineConfig(
+            name="wrapped",
+            bin="/usr/bin/env",
+            args_template=(missing_child, "{spec}"),
+            full_access_args=(),
+            sandbox_args=(),
+            token_regex=None,
+            env_allowlist=("PATH",),
+            preflight_executables=(sys.executable,),
+            worker_executable=missing_child,
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "worker executable not found.*ringer-definitely-missing-launched-child",
+        ):
+            preflight_engine_bins(
+                self.manifest(self.base_task(engine="wrapped")),
+                self.config({"wrapped": wrapped}),
+            )
 
 
 if __name__ == "__main__":

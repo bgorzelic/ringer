@@ -1,14 +1,23 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import importlib.util
+import os
+import stat
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 CHECK_PATH = ROOT / "templates" / "fix-swarm" / "checks" / "fix-swarm.py"
+
+spec = importlib.util.spec_from_file_location("fix_swarm_check", CHECK_PATH)
+fix_swarm_check = importlib.util.module_from_spec(spec)
+sys.modules["fix_swarm_check"] = fix_swarm_check
+spec.loader.exec_module(fix_swarm_check)
 
 
 VALID_FIX_SUMMARY = """# Fix Summary
@@ -151,6 +160,72 @@ class FixSwarmCheckTests(unittest.TestCase):
         self.assertIn("missing_summary", result.stdout)
         self.assertFalse(self.patch_path.exists())
         self.assertFalse(self.exported_summary_path.exists())
+
+
+class PublishAllTransactionTests(unittest.TestCase):
+    """Fault-injects a failure on the second (exported-summary) publish to
+    verify publish_all() is transactional: nothing new is left behind, and
+    any pre-existing bytes/mode are restored unchanged."""
+
+    def setUp(self) -> None:
+        temp_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(temp_dir.cleanup)
+        self.export_dir = Path(temp_dir.name)
+        self.patch_path = self.export_dir / "fix.patch"
+        self.summary_path = self.export_dir / "fix-summary.exported.md"
+
+    def _publish_and_fail_on_second(self) -> None:
+        original_commit = fix_swarm_check._commit
+        calls: list[Path] = []
+
+        def fake_commit(tmp_path: Path, final_path: Path) -> None:
+            calls.append(final_path)
+            if len(calls) == 2:
+                raise OSError("simulated failure on second publish")
+            original_commit(tmp_path, final_path)
+
+        with mock.patch.object(fix_swarm_check, "_commit", side_effect=fake_commit):
+            with self.assertRaises(OSError):
+                fix_swarm_check.publish_all(
+                    [
+                        (self.patch_path, "new patch content\n"),
+                        (self.summary_path, "new summary content\n"),
+                    ]
+                )
+
+    def test_normal_success_publishes_both(self) -> None:
+        fix_swarm_check.publish_all(
+            [
+                (self.patch_path, "patch content\n"),
+                (self.summary_path, "summary content\n"),
+            ]
+        )
+
+        self.assertEqual("patch content\n", self.patch_path.read_text(encoding="utf-8"))
+        self.assertEqual("summary content\n", self.summary_path.read_text(encoding="utf-8"))
+
+    def test_second_publish_failure_with_absent_outputs_leaves_nothing(self) -> None:
+        self._publish_and_fail_on_second()
+
+        self.assertFalse(self.patch_path.exists())
+        self.assertFalse(self.summary_path.exists())
+        leftovers = list(self.export_dir.iterdir())
+        self.assertEqual([], leftovers, leftovers)
+
+    def test_second_publish_failure_with_pre_existing_sentinels_restores_them(self) -> None:
+        self.patch_path.write_text("sentinel patch\n", encoding="utf-8")
+        os.chmod(self.patch_path, 0o640)
+        self.summary_path.write_text("sentinel summary\n", encoding="utf-8")
+        os.chmod(self.summary_path, 0o600)
+
+        self._publish_and_fail_on_second()
+
+        self.assertEqual("sentinel patch\n", self.patch_path.read_text(encoding="utf-8"))
+        self.assertEqual(0o640, stat.S_IMODE(self.patch_path.stat().st_mode))
+        self.assertEqual("sentinel summary\n", self.summary_path.read_text(encoding="utf-8"))
+        self.assertEqual(0o600, stat.S_IMODE(self.summary_path.stat().st_mode))
+        leftovers = [item for item in self.export_dir.iterdir() if item not in (self.patch_path, self.summary_path)]
+        self.assertEqual([], leftovers, leftovers)
 
 
 if __name__ == "__main__":

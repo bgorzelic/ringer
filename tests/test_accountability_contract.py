@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import io
 import sys
 import tempfile
 import threading
@@ -26,6 +28,7 @@ from ringer import (  # noqa: E402
     load_engines,
     model_scoreboard_tier,
     proven_model_group,
+    print_summary,
     render_final_report_html,
 )
 
@@ -272,6 +275,7 @@ class AccountabilityContractTests(unittest.TestCase):
                     "tokens_unknown": True,
                     "access_class": "unavailable",
                     "access_label": "Offline",
+                    "blocked_kind": "spawn",
                     "blocked_reason": "Worker process could not be started.",
                 },
             ],
@@ -283,7 +287,7 @@ class AccountabilityContractTests(unittest.TestCase):
         self.assertIn("Passed after retry", html)
         self.assertIn("Tokens: partial (40 known; at least one attempt unknown)", html)
         self.assertIn("Configured access: subscription (Team plan)", html)
-        self.assertIn("Blocked: Worker process could not be started.", html)
+        self.assertIn("Blocked (spawn): Worker process could not be started.", html)
         self.assertIn("Token accounting: partial", html)
 
     def test_failure_paths_set_concise_non_secret_blocked_reasons(self) -> None:
@@ -294,13 +298,23 @@ class AccountabilityContractTests(unittest.TestCase):
             dashboard_enabled=False,
         )
         preparation_runtime = preparation_runner.runtimes[0]
+        preparation_error_kinds: list[str | None] = []
+        original_log_attempt = preparation_runner._log_attempt
+
+        def capture_prepare_attempt(*args: object) -> None:
+            preparation_error_kinds.append(getattr(args[3], "error_kind", None))
+
+        preparation_runner._log_attempt = capture_prepare_attempt  # type: ignore[method-assign]
         asyncio.run(
             preparation_runner._record_prepare_error(
                 preparation_runtime,
                 "private detail secret=do-not-emit",
             )
         )
+        preparation_runner._log_attempt = original_log_attempt  # type: ignore[method-assign]
         self.assertEqual("Task preparation failed.", preparation_runtime.blocked_reason)
+        self.assertEqual("preparation", preparation_runtime.blocked_kind)
+        self.assertEqual(["preparation"], preparation_error_kinds)
         self.assertNotIn("secret", preparation_runtime.blocked_reason or "")
         preparation_runner.logger.close()
 
@@ -315,6 +329,7 @@ class AccountabilityContractTests(unittest.TestCase):
             "Worker configuration prevented this task from starting.",
             config_runner.runtimes[0].blocked_reason,
         )
+        self.assertEqual("configuration", config_runner.runtimes[0].blocked_kind)
         config_runner.logger.close()
 
         spawn_engine = self.engine(name="broken", bin_path=str(self.root / "missing-worker"))
@@ -329,6 +344,7 @@ class AccountabilityContractTests(unittest.TestCase):
             "Worker process could not be started.",
             spawn_runner.runtimes[0].blocked_reason,
         )
+        self.assertEqual("spawn", spawn_runner.runtimes[0].blocked_kind)
         spawn_runner.logger.close()
 
         runner_runtime = self.runtime("runner-failure")
@@ -342,8 +358,84 @@ class AccountabilityContractTests(unittest.TestCase):
         runner.runtimes = [runner_runtime]
         runner._mark_unfinished_tasks_failed("unexpected private detail")
         self.assertEqual("Runner stopped before task completion.", runner_runtime.blocked_reason)
+        self.assertEqual("runner", runner_runtime.blocked_kind)
         self.assertEqual("Runner stopped before task completion.", runner_writer.snapshot()["tasks"][0]["blocked_reason"])
+        self.assertEqual("runner", runner_writer.snapshot()["tasks"][0]["blocked_kind"])
+        for blocked_runtime in (
+            preparation_runtime,
+            config_runner.runtimes[0],
+            spawn_runner.runtimes[0],
+            runner_runtime,
+        ):
+            with self.subTest(blocked_kind=blocked_runtime.blocked_kind):
+                reason = (blocked_runtime.blocked_reason or "").lower()
+                self.assertNotIn("secret", reason)
+                self.assertNotIn("private", reason)
         runner.logger.close()
+
+    def test_cancelled_path_sets_closed_kind_and_secret_free_reason(self) -> None:
+        runner = RingerRunner(
+            self.manifest(engine="mock"),
+            self.config({"mock": self.engine()}),
+            "tester",
+            dashboard_enabled=False,
+        )
+
+        async def cancel_worker(
+            _runtime: TaskRuntime,
+            _spec: str,
+            _attempt: int,
+        ) -> object:
+            raise asyncio.CancelledError("private cancellation detail")
+
+        runner._run_worker = cancel_worker  # type: ignore[method-assign]
+        with self.assertRaises(asyncio.CancelledError):
+            asyncio.run(runner._run_task(runner.runtimes[0]))
+        runtime = runner.runtimes[0]
+        self.assertEqual("cancelled", runtime.blocked_kind)
+        self.assertEqual("Task was cancelled before completion.", runtime.blocked_reason)
+        self.assertNotIn("private", runtime.blocked_reason or "")
+        runner.logger.close()
+
+    def test_state_and_report_keep_legacy_null_blocked_kind_safe(self) -> None:
+        runtime = self.runtime("legacy")
+        runtime.blocked_reason = "Legacy blocked detail."
+        state = self.writer([runtime]).snapshot()
+        self.assertIsNone(state["tasks"][0]["blocked_kind"])
+
+        task_state = state["tasks"][0]
+        task_state.pop("blocked_kind")
+        state["finished"] = True
+        state["elapsed_s"] = 0
+        html = render_final_report_html(state)
+        self.assertIn("Blocked: Legacy blocked detail.", html)
+
+    def test_terminal_summary_matches_accountability_fields_without_auth_claims(self) -> None:
+        passed = self.runtime("retry-pass")
+        passed.status = "pass"
+        passed.final_verdict = "PASS"
+        passed.attempts = 2
+        passed.record_tokens(None)
+        passed.record_tokens(None)
+
+        blocked = self.runtime("blocked")
+        blocked.status = "fail"
+        blocked.final_verdict = "ERROR"
+        blocked.blocked_kind = "spawn"
+        blocked.blocked_reason = "Worker process could not be started."
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            print_summary(
+                "run-1",
+                [passed, blocked],
+                {"mock": self.engine(access_class="subscription", access_label="Team plan")},
+            )
+        rendered = output.getvalue()
+        self.assertIn("Passed after retry", rendered)
+        self.assertIn("Configured access: subscription (Team plan)", rendered)
+        self.assertIn("Blocked (spawn): Worker process could not be started.", rendered)
+        self.assertNotIn("authenticated", rendered.lower())
+        self.assertNotIn("exact", rendered.lower())
 
     def test_cli_and_web_tiers_share_exact_threshold_policy(self) -> None:
         two_of_three = 2 / 3

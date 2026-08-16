@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -110,17 +111,72 @@ def validate_summary(summary_path: Path) -> tuple[str, list[str]]:
     return text, failures
 
 
-def atomic_publish(final_path: Path, content: str) -> None:
+def stage_temp_file(final_path: Path, content: str) -> Path:
     final_path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(dir=str(final_path.parent), prefix=f".{final_path.name}.", suffix=".tmp")
     tmp_path = Path(tmp_name)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             handle.write(content)
-        tmp_path.replace(final_path)
     except BaseException:
         tmp_path.unlink(missing_ok=True)
         raise
+    return tmp_path
+
+
+def snapshot(path: Path) -> tuple[bytes, int] | None:
+    if not path.is_file():
+        return None
+    data = path.read_bytes()
+    mode = stat.S_IMODE(path.stat().st_mode)
+    return data, mode
+
+
+def restore(path: Path, saved: tuple[bytes, int] | None) -> None:
+    if saved is None:
+        path.unlink(missing_ok=True)
+        return
+    data, mode = saved
+    path.write_bytes(data)
+    os.chmod(path, mode)
+
+
+def _commit(tmp_path: Path, final_path: Path) -> None:
+    tmp_path.replace(final_path)
+
+
+def publish_all(targets: list[tuple[Path, str]]) -> None:
+    """Publish every (final_path, content) target transactionally.
+
+    All targets are staged into validated temp files before any final path
+    is touched. Targets are then committed in order; if a later commit
+    fails, every already-committed target is rolled back to its
+    pre-existing bytes/mode (or removed if it did not exist before), so a
+    partial publish never leaves this invocation's output in place.
+    """
+    staged: list[tuple[Path, Path]] = []
+    try:
+        for final_path, content in targets:
+            tmp_path = stage_temp_file(final_path, content)
+            staged.append((final_path, tmp_path))
+            if tmp_path.read_text(encoding="utf-8") != content:
+                raise OSError(f"staged content for {final_path} failed validation")
+
+        snapshots = [snapshot(final_path) for final_path, _ in staged]
+
+        committed: list[tuple[Path, tuple[bytes, int] | None]] = []
+        try:
+            for (final_path, tmp_path), saved in zip(staged, snapshots):
+                _commit(tmp_path, final_path)
+                committed.append((final_path, saved))
+        except BaseException:
+            for final_path, saved in committed:
+                restore(final_path, saved)
+            raise
+    finally:
+        for _, tmp_path in staged:
+            if tmp_path.exists():
+                tmp_path.unlink(missing_ok=True)
 
 
 def main() -> int:
@@ -190,8 +246,7 @@ def main() -> int:
         return 1
 
     try:
-        atomic_publish(args.patch, patch_content)
-        atomic_publish(args.exported_summary, summary_text)
+        publish_all([(args.patch, patch_content), (args.exported_summary, summary_text)])
     except OSError as exc:
         print(fail("export_failed", f"failed to publish exports: {exc}"))
         return 1

@@ -66,8 +66,10 @@ env_allowlist = [
   "XDG_DATA_HOME",
 ]
 
-# Every real CLI behind a launcher or wrapper must be declared here. Ringer
-# validates both `bin` and each declaration before starting any task slot.
+# The worker identity must match the executable Ringer actually launches.
+# Direct engines bind this to `bin`; /usr/bin/env engines must declare the
+# child after env flags and assignments. Extra preflight tools are additive.
+worker_executable = "codex"
 preflight_executables = ["codex"]
 
 # Placeholders:
@@ -107,6 +109,7 @@ token_regex = "tokens\\s+used\\s*:?\\s*([0-9][0-9,]*)"
 # Uncomment to enable.
 # [engines.grok]
 # bin = "grok"
+# worker_executable = "grok"
 # env_allowlist = ["HOME", "PATH", "TMPDIR", "XDG_CONFIG_HOME"]
 # preflight_executables = ["grok"]
 # model_default = "grok-composer-2.5-fast"
@@ -133,6 +136,7 @@ token_regex = "tokens\\s+used\\s*:?\\s*([0-9][0-9,]*)"
 # For CI, acceptance evals, and trying Ringer without an API bill.
 # [engines.mock]
 # bin = "python3"
+# worker_executable = "python3"
 # access_class = "local"
 # access_label = "Local test worker"
 # env_allowlist = ["PATH"]
@@ -159,6 +163,7 @@ token_regex = "tokens\\s+used\\s*:?\\s*([0-9][0-9,]*)"
 # Uncomment and set an absolute path for `bin` to enable.
 # [engines.opencode]
 # bin = "/absolute/path/to/ringer/engines/opencode-sandboxed.sh"
+# worker_executable = "/absolute/path/to/ringer/engines/opencode-sandboxed.sh"
 # env_allowlist = ["HOME", "PATH", "TMPDIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME"]
 # preflight_executables = ["opencode"]
 # model_default = "openrouter/z-ai/glm-5.2"

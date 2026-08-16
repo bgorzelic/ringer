@@ -153,6 +153,36 @@ class LintManifestTests(unittest.TestCase):
             "one: check may fail without printing why; retry prompt and eval log depend on failure output.",
         )
 
+        enclosing_redirect_manifest = self.manifest(
+            [
+                self.task(
+                    check=(
+                        "test -s missing.txt || "
+                        "{ echo 'FAIL: missing'; exit 1; } >/dev/null"
+                    )
+                )
+            ]
+        )
+        self.assertHasFinding(
+            lint_manifest(enclosing_redirect_manifest),
+            "one: check may fail without printing why; retry prompt and eval log depend on failure output.",
+        )
+
+        enclosing_redirect_stderr_manifest = self.manifest(
+            [
+                self.task(
+                    check=(
+                        "test -s missing.txt || "
+                        "{ echo 'FAIL: missing' >&2; exit 1; } >/dev/null"
+                    )
+                )
+            ]
+        )
+        self.assertNotIn(
+            "one: check may fail without printing why; retry prompt and eval log depend on failure output.",
+            lint_manifest(enclosing_redirect_stderr_manifest),
+        )
+
     def test_w3_worktree_deliverable_loss(self) -> None:
         manifest = self.manifest(
             [self.task(expect_files=["report.md"])],

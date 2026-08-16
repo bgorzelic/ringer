@@ -194,6 +194,78 @@ Confidence: high"""
         failures = validate_report(missing_path, "login surface")
         self.assertTrue(any("missing_report" in item for item in failures))
 
+    def test_empty_finding_title_fails(self) -> None:
+        finding = VALID_FINDING.replace("### Finding: SQL injection in login handler", "### Finding:")
+        report = VALID_REPORT.replace(VALID_FINDING, finding)
+        failures = validate_report(self.write_report(report), "login surface")
+        self.assertTrue(any("finding_empty_title" in item for item in failures), failures)
+
+    def test_whitespace_only_finding_title_fails(self) -> None:
+        finding = VALID_FINDING.replace("### Finding: SQL injection in login handler", "### Finding:    ")
+        report = VALID_REPORT.replace(VALID_FINDING, finding)
+        failures = validate_report(self.write_report(report), "login surface")
+        self.assertTrue(any("finding_empty_title" in item for item in failures), failures)
+
+    def test_empty_field_value_fails(self) -> None:
+        # A bare 'Priority:' label with no value must not be accepted as a
+        # valid field, even though the label text is technically present.
+        finding = VALID_FINDING.replace("Priority: P0", "Priority:")
+        report = VALID_REPORT.replace(VALID_FINDING, finding)
+        failures = validate_report(self.write_report(report), "login surface")
+        self.assertTrue(
+            any("finding_empty_field" in item and "Priority:" in item for item in failures),
+            f"expected an empty-field failure for Priority, got: {failures}",
+        )
+
+    def test_duplicate_field_line_fails(self) -> None:
+        # A second 'Priority:' line must be rejected even if the first one
+        # is well-formed; only a single value per field is allowed.
+        finding = VALID_FINDING + "\nPriority: P1"
+        report = VALID_REPORT.replace(VALID_FINDING, finding)
+        failures = validate_report(self.write_report(report), "login surface")
+        self.assertTrue(
+            any("finding_duplicate_field" in item and "Priority:" in item for item in failures),
+            f"expected a duplicate-field failure for Priority, got: {failures}",
+        )
+
+    def test_duplicate_evidence_line_fails(self) -> None:
+        finding = VALID_FINDING.replace(
+            "Evidence: app/auth.py:42 concatenates user input into a query",
+            "Evidence: app/auth.py:42 concatenates user input into a query\n"
+            "Evidence: app/auth.py:43 also concatenates user input",
+        )
+        report = VALID_REPORT.replace(VALID_FINDING, finding)
+        failures = validate_report(self.write_report(report), "login surface")
+        self.assertTrue(
+            any("finding_duplicate_field" in item and "Evidence:" in item for item in failures),
+            f"expected a duplicate-field failure for Evidence, got: {failures}",
+        )
+
+    def test_prose_mentioning_label_does_not_satisfy_field(self) -> None:
+        # A label mentioned mid-sentence (not as its own field line) must
+        # not be accepted as fulfilling the field requirement.
+        finding = VALID_FINDING.replace(
+            "Fix: use parameterized queries",
+            "Recommended Fix: use parameterized queries",
+        )
+        report = VALID_REPORT.replace(VALID_FINDING, finding)
+        failures = validate_report(self.write_report(report), "login surface")
+        self.assertTrue(
+            any("finding_missing_field" in item and "Fix:" in item for item in failures),
+            f"expected a missing-field failure for Fix, got: {failures}",
+        )
+
+    def test_prose_mentioning_priority_label_does_not_satisfy_canonical_priority(self) -> None:
+        # Mentioning 'Priority:' inside prose elsewhere in the block must not
+        # substitute for a real 'Priority: P#' field line.
+        finding = VALID_FINDING.replace("Priority: P0", "See Priority: P0 rationale below.")
+        report = VALID_REPORT.replace(VALID_FINDING, finding)
+        failures = validate_report(self.write_report(report), "login surface")
+        self.assertTrue(
+            any("finding_missing_field" in item and "Priority:" in item for item in failures),
+            f"expected a missing-field failure for Priority, got: {failures}",
+        )
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

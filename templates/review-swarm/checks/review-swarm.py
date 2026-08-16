@@ -61,10 +61,18 @@ def split_finding_blocks(findings: str) -> list[str]:
     return [findings[starts[i] : starts[i + 1]] for i in range(len(starts) - 1)]
 
 
+def field_line_values(block: str, field: str) -> list[str]:
+    """Values of lines that are EXACTLY the given field label (e.g. 'Evidence:')
+    at the start of the line, not prose that merely mentions the label."""
+    pattern = re.compile(rf"^[ \t]*{re.escape(field)}[ \t]*(.*)$", re.IGNORECASE | re.MULTILINE)
+    return [match.group(1).strip() for match in pattern.finditer(block)]
+
+
 def validate_finding_block(block: str, index: int) -> list[str]:
     failures: list[str] = []
     heading_line = block.splitlines()[0].strip() if block.splitlines() else ""
-    if not CANONICAL_FINDING_HEADING_RE.match(heading_line):
+    heading_match = CANONICAL_FINDING_HEADING_RE.match(heading_line)
+    if not heading_match:
         failures.append(
             fail(
                 "finding_bad_heading",
@@ -72,9 +80,23 @@ def validate_finding_block(block: str, index: int) -> list[str]:
                 f"(found: {heading_line!r})",
             )
         )
+    elif not heading_line[heading_match.end():].strip():
+        failures.append(
+            fail(
+                "finding_empty_title",
+                f"finding {index} heading must include a nonempty summary after 'Finding:'",
+            )
+        )
+
     for field in FINDING_FIELDS:
-        if field.lower() not in block.lower():
+        values = field_line_values(block, field)
+        if not values:
             failures.append(fail("finding_missing_field", f"finding {index} is missing {field}"))
+        elif len(values) > 1:
+            failures.append(fail("finding_duplicate_field", f"finding {index} has more than one {field} line"))
+        elif not values[0]:
+            failures.append(fail("finding_empty_field", f"finding {index} {field} has no value"))
+
     if "Evidence:" in block and not re.search(r"\b[\w./-]+:\d+\b", block):
         failures.append(fail("finding_missing_line", f"finding {index} evidence should cite file:line"))
     if not re.search(r"Priority:\s*P[0-3]\b", block, re.IGNORECASE):

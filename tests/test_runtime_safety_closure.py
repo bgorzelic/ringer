@@ -427,6 +427,7 @@ class SilentCheckLintTests(unittest.TestCase):
             "test -s output.txt || exit 1",
             "test -s output.txt || false",
             "test -s output.txt || { echo 'FAIL: missing' >/dev/null; exit 1; }",
+            "test -s missing.txt || { echo 'FAIL: missing'; exit 1; } >/dev/null",
             "grep -q ready output.txt || { printf 'FAIL: missing\\n' >failure.log; exit 1; }",
             "test -s output.txt || { exit 1; echo 'FAIL: unreachable'; }",
         ):
@@ -437,6 +438,7 @@ class SilentCheckLintTests(unittest.TestCase):
         for check in (
             "test -s output.txt || { echo 'FAIL: output.txt missing'; exit 1; }",
             "grep -q ready output.txt || { printf 'FAIL: ready marker missing\\n' >&2; exit 1; }",
+            "test -s output.txt || { echo 'FAIL: output.txt missing' >&2; exit 1; } >/dev/null",
         ):
             with self.subTest(check=check):
                 self.assertFalse(check_may_fail_silently(check))

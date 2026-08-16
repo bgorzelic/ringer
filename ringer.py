@@ -41,7 +41,7 @@ from html import escape as html_escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Iterable, Mapping
+from typing import Any, Iterable, Literal, Mapping
 
 
 TOOL_NAME = "ringer"
@@ -66,6 +66,10 @@ ACCESS_CLASSES = {
     "metered",
     "unavailable",
 }
+BLOCKED_KINDS = frozenset(
+    {"configuration", "preparation", "spawn", "cancelled", "runner"}
+)
+BlockedKind = Literal["configuration", "preparation", "spawn", "cancelled", "runner"]
 CODEX_ENV_ALLOWLIST = (
     "CODEX_HOME",
     "COLORTERM",
@@ -143,9 +147,13 @@ class EngineConfig:
     # Values are runtime-only and must never be included in logs or state.
     env_allowlist: tuple[str, ...] = ()
     # Additional real executables to validate before any task starts. This is
-    # required for launchers such as /usr/bin/env whose own existence does not
-    # prove that the worker CLI behind them is installed.
+    # useful for wrappers with other tool dependencies, but it never defines
+    # or substitutes for the executable identity actually launched.
     preflight_executables: tuple[str, ...] = ()
+    # Exact worker executable identity. Direct launches are always bound to
+    # `bin`; /usr/bin/env launches must declare the child found after supported
+    # env flags and assignments in args_template.
+    worker_executable: str | None = None
 
     @property
     def process_name(self) -> str:
@@ -367,6 +375,7 @@ def built_in_codex_engine() -> EngineConfig:
         token_regex=DEFAULT_TOKEN_REGEX,
         env_allowlist=CODEX_ENV_ALLOWLIST,
         preflight_executables=(resolved,),
+        worker_executable=resolved,
     )
 
 
@@ -472,6 +481,18 @@ def load_engines(raw: Any) -> dict[str, EngineConfig]:
                 executable,
                 key=f"engines.{clean_name}.preflight_executables",
             )
+        worker_executable = optional_plain_string(
+            section.get(
+                "worker_executable",
+                base.worker_executable if base else None,
+            ),
+            key=f"engines.{clean_name}.worker_executable",
+        )
+        if worker_executable is not None:
+            validate_executable_declaration(
+                worker_executable,
+                key=f"engines.{clean_name}.worker_executable",
+            )
         engines[clean_name] = EngineConfig(
             name=clean_name,
             bin=bin_path,
@@ -484,6 +505,7 @@ def load_engines(raw: Any) -> dict[str, EngineConfig]:
             model_default=model_default,
             env_allowlist=env_allowlist,
             preflight_executables=preflight_executables,
+            worker_executable=worker_executable,
         )
     return engines
 
@@ -865,15 +887,46 @@ def has_failure_output_branch(command: str) -> bool:
     if "||" not in command:
         return False
     branch = command.split("||", 1)[1]
+    stdout_suppressed, stderr_suppressed = enclosing_group_output_suppression(branch)
     for part in command_parts(branch):
-        if command_prints_visible_failure(part):
+        if command_prints_visible_failure(
+            part,
+            stdout_suppressed=stdout_suppressed,
+            stderr_suppressed=stderr_suppressed,
+        ):
             return True
         if has_command_prefix(part, ("exit",)) or has_command_prefix(part, ("false",)):
             return False
     return False
 
 
-def command_prints_visible_failure(command: str) -> bool:
+def enclosing_group_output_suppression(branch: str) -> tuple[bool, bool]:
+    match = re.search(
+        r"[})]\s*(?P<redirects>(?:(?:\d?>{1,2}|&>|>&)\s*\S+\s*)+)$",
+        branch,
+    )
+    if not match:
+        return False, False
+    redirects = match.group("redirects")
+    stdout_suppressed = bool(
+        re.search(r"(?:^|\s)(?:1?>{1,2}|&>|>&)\s*(?!&2(?:\s|$)|/dev/stderr(?:\s|$))\S+", redirects)
+    )
+    stderr_suppressed = bool(
+        re.search(r"(?:^|\s)(?:2>{1,2}|&>|>&)\s*(?!&1(?:\s|$)|/dev/stdout(?:\s|$))\S+", redirects)
+    )
+    if stdout_suppressed and re.search(r"(?:^|\s)2>&1(?=\s|$)", redirects):
+        stderr_suppressed = True
+    if stderr_suppressed and re.search(r"(?:^|\s)1?>&2(?=\s|$)", redirects):
+        stdout_suppressed = True
+    return stdout_suppressed, stderr_suppressed
+
+
+def command_prints_visible_failure(
+    command: str,
+    *,
+    stdout_suppressed: bool = False,
+    stderr_suppressed: bool = False,
+) -> bool:
     cleaned = command.strip(" \t{}()")
     try:
         tokens = shlex.split(cleaned)
@@ -883,10 +936,15 @@ def command_prints_visible_failure(command: str) -> bool:
         return False
     if tokens[0] in {"echo", "printf"} and len(tokens) < 2:
         return False
+    prints_to_stderr = bool(
+        re.search(r"(?:^|\s)(?:1?>&2|1?>/dev/stderr)(?=\s|$)", cleaned)
+    )
+    if (prints_to_stderr and stderr_suppressed) or (not prints_to_stderr and stdout_suppressed):
+        return False
     # stderr is captured by Ringer, so >&2 remains useful. Any other stdout
     # redirection hides the diagnostic from the retry prompt and eval log.
     without_visible_stderr = re.sub(
-        r"(?:^|\s)1?>&2(?=\s|$)",
+        r"(?:^|\s)(?:1?>&2|1?>/dev/stderr)(?=\s|$)",
         " ",
         cleaned,
     )
@@ -1019,6 +1077,7 @@ class TaskRuntime:
     token_attempts: int = 0
     token_known_attempts: int = 0
     token_unknown_attempts: int = 0
+    blocked_kind: BlockedKind | None = None
     blocked_reason: str | None = None
     final_verdict: str | None = None
     last_check_returncode: int | None = None
@@ -1118,7 +1177,7 @@ class WorkerResult:
     timed_out: bool
     tokens: int | None
     error: str | None = None
-    error_kind: str | None = None
+    error_kind: BlockedKind | None = None
 
 
 @dataclass(frozen=True)
@@ -1315,6 +1374,7 @@ class StateWriter:
                         "elapsed_s": round(runtime.elapsed_s(now), 1),
                         **token_accounting,
                         "attempts": runtime.attempts,
+                        "blocked_kind": runtime.blocked_kind,
                         "blocked_reason": runtime.blocked_reason,
                         "children": ProcessTree.count_named_descendants(
                             runtime.worker_pid, children, commands, process_name
@@ -3626,9 +3686,12 @@ def render_work_group(
         "Configured access: "
         + access_accounting_text(task.get("access_class"), task.get("access_label"))
     )
-    blocked_reason = str(task.get("blocked_reason") or "").strip()
-    if blocked_reason:
-        accountability_parts.append(f"Blocked: {blocked_reason}")
+    blocked_text = blocked_accounting_text(
+        task.get("blocked_kind"),
+        task.get("blocked_reason"),
+    )
+    if blocked_text:
+        accountability_parts.append(blocked_text)
     accountability_html = (
         '<span class="verified accountability">'
         + html_escape(" · ".join(accountability_parts))
@@ -3885,6 +3948,14 @@ def access_accounting_text(access_class: Any, access_label: Any) -> str:
     class_text = str(access_class or "unknown/unset")
     label_text = str(access_label or "").strip()
     return f"{class_text} ({label_text})" if label_text else class_text
+
+
+def blocked_accounting_text(blocked_kind: Any, blocked_reason: Any) -> str:
+    reason_text = str(blocked_reason or "").strip()
+    if not reason_text:
+        return ""
+    kind_text = str(blocked_kind or "").strip()
+    return f"Blocked ({kind_text}): {reason_text}" if kind_text else f"Blocked: {reason_text}"
 
 
 def render_run_accountability(state: dict[str, Any]) -> str:
@@ -7357,7 +7428,7 @@ class RingerRunner:
             with cleanup:
                 self.logger.close()
             with cleanup:
-                print_summary(self.run_id, self.runtimes)
+                print_summary(self.run_id, self.runtimes, self.config.engines)
                 print("Model log updated; run './ringer.py models' for the per-model scoreboard.")
             # The post-run journey: tell a human exactly where the results live.
             with contextlib.suppress(Exception):
@@ -7388,7 +7459,7 @@ class RingerRunner:
                 runtime.final_verdict = "ERROR"
                 runtime.worker_pid = None
                 runtime.last_check_output = reason
-                runtime.blocked_reason = "Runner stopped before task completion."
+                set_runtime_blocked(runtime, "runner")
                 while runtime.token_attempts < runtime.attempts:
                     runtime.record_tokens(None)
                 runtime.ended_at_monotonic = runtime.ended_at_monotonic or now
@@ -7397,6 +7468,20 @@ class RingerRunner:
                 append_text(runtime.log_path, f"[ringer.py] {reason}\n")
 
     async def _run_task(self, runtime: TaskRuntime) -> None:
+        try:
+            await self._run_task_inner(runtime)
+        except asyncio.CancelledError:
+            with self.lock:
+                runtime.status = "fail"
+                runtime.final_verdict = "ERROR"
+                runtime.worker_pid = None
+                set_runtime_blocked(runtime, "cancelled")
+                while runtime.token_attempts < runtime.attempts:
+                    runtime.record_tokens(None)
+                runtime.ended_at_monotonic = runtime.ended_at_monotonic or time.monotonic()
+            raise
+
+    async def _run_task_inner(self, runtime: TaskRuntime) -> None:
         async with self.semaphore:
             with self.lock:
                 runtime.started_at_monotonic = time.monotonic()
@@ -7422,7 +7507,7 @@ class RingerRunner:
                     runtime.status = "verifying"
                     runtime.record_tokens(worker.tokens)
                     if worker.error:
-                        runtime.blocked_reason = worker_blocked_reason(worker.error_kind)
+                        set_runtime_blocked(runtime, worker.error_kind or "runner")
                 verify = await self.verifier.verify(
                     runtime.task,
                     runtime.taskdir,
@@ -7609,7 +7694,7 @@ class RingerRunner:
             runtime.attempts = 1
             runtime.status = "fail"
             runtime.final_verdict = "ERROR"
-            runtime.blocked_reason = "Task preparation failed."
+            set_runtime_blocked(runtime, "preparation")
             runtime.record_tokens(None)
             runtime.ended_at_monotonic = time.monotonic()
         verify = VerifyResult(
@@ -7618,7 +7703,13 @@ class RingerRunner:
             check_timed_out=False,
             raw_output_excerpt="",
         )
-        worker = WorkerResult(returncode=None, timed_out=False, tokens=None, error=error)
+        worker = WorkerResult(
+            returncode=None,
+            timed_out=False,
+            tokens=None,
+            error=error,
+            error_kind="preparation",
+        )
         self._log_attempt(runtime, runtime.task.spec, False, worker, verify, "ERROR", 0)
 
     async def _run_worker(self, runtime: TaskRuntime, spec: str, attempt: int) -> WorkerResult:
@@ -7767,6 +7858,7 @@ class RingerRunner:
         ]
         if worker.error:
             notes_parts.append(f"worker_error={worker.error}")
+            notes_parts.append(f"worker_error_kind={worker.error_kind}")
         if verify.missing_files:
             notes_parts.append(f"missing_expect_files={json.dumps(list(verify.missing_files))}")
         if verify.stale_files:
@@ -7861,12 +7953,22 @@ def verdict_for(worker: WorkerResult, verify: VerifyResult) -> str:
     return "FAIL"
 
 
-def worker_blocked_reason(error_kind: str | None) -> str:
-    return {
+def worker_blocked_reason(error_kind: BlockedKind) -> str:
+    reasons = {
         "configuration": "Worker configuration prevented this task from starting.",
-        "preparation": "Worker preparation failed.",
+        "preparation": "Task preparation failed.",
         "spawn": "Worker process could not be started.",
-    }.get(error_kind, "Runner failed before the worker could complete.")
+        "cancelled": "Task was cancelled before completion.",
+        "runner": "Runner stopped before task completion.",
+    }
+    if error_kind not in BLOCKED_KINDS:
+        raise ValueError(f"unsupported blocked kind: {error_kind}")
+    return reasons[error_kind]
+
+
+def set_runtime_blocked(runtime: TaskRuntime, blocked_kind: BlockedKind) -> None:
+    runtime.blocked_kind = blocked_kind
+    runtime.blocked_reason = worker_blocked_reason(blocked_kind)
 
 
 def build_run_id(run_name: str) -> str:
@@ -8005,8 +8107,135 @@ ENGINE_INSTALL_HINTS = {
 }
 
 
+def env_child_executable(
+    arguments: Iterable[str],
+    *,
+    engine_name: str,
+    default_search_path: str,
+) -> tuple[str, str]:
+    """Return the child executable selected by /usr/bin/env.
+
+    Only flags whose operand shape is deterministic are accepted. Failing
+    closed here keeps preflight bound to the command that subprocess will run.
+    """
+    pending = list(arguments)
+    index = 0
+    environment_search_path = default_search_path
+    alternate_search_path: str | None = None
+    while index < len(pending):
+        argument = pending[index]
+        if argument == "--":
+            index += 1
+            break
+        assignment = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", argument)
+        if assignment:
+            if assignment.group(1) == "PATH":
+                environment_search_path = assignment.group(2)
+            index += 1
+            continue
+        if re.fullmatch(r"-[iv0]+", argument) or argument in {
+            "--ignore-environment",
+            "--null",
+            "--debug",
+        }:
+            if "i" in argument or argument == "--ignore-environment":
+                environment_search_path = os.defpath
+            index += 1
+            continue
+        if argument in {"-u", "--unset", "-C", "--chdir", "-a", "--argv0", "-P"}:
+            if index + 1 >= len(pending):
+                raise ValueError(
+                    f"engine '{engine_name}' /usr/bin/env flag {argument} is missing its operand"
+                )
+            if argument == "-P":
+                alternate_search_path = pending[index + 1]
+            elif argument in {"-u", "--unset"} and pending[index + 1] == "PATH":
+                environment_search_path = os.defpath
+            index += 2
+            continue
+        if argument in {"-S", "--split-string"}:
+            if index + 1 >= len(pending):
+                raise ValueError(
+                    f"engine '{engine_name}' /usr/bin/env flag {argument} is missing its operand"
+                )
+            try:
+                split_arguments = shlex.split(pending[index + 1])
+            except ValueError as exc:
+                raise ValueError(
+                    f"engine '{engine_name}' /usr/bin/env split string is invalid: {exc}"
+                ) from exc
+            pending[index : index + 2] = split_arguments
+            continue
+        if re.match(r"^--(?:unset|chdir|argv0)=", argument):
+            if argument == "--unset=PATH":
+                environment_search_path = os.defpath
+            index += 1
+            continue
+        if argument.startswith("--split-string="):
+            try:
+                split_arguments = shlex.split(argument.split("=", 1)[1])
+            except ValueError as exc:
+                raise ValueError(
+                    f"engine '{engine_name}' /usr/bin/env split string is invalid: {exc}"
+                ) from exc
+            pending[index : index + 1] = split_arguments
+            continue
+        if re.match(r"^-(?:u|C|a).+", argument):
+            if argument == "-uPATH":
+                environment_search_path = os.defpath
+            index += 1
+            continue
+        if argument.startswith("-P") and len(argument) > 2:
+            alternate_search_path = argument[2:]
+            index += 1
+            continue
+        if argument.startswith("-S") and len(argument) > 2:
+            try:
+                split_arguments = shlex.split(argument[2:])
+            except ValueError as exc:
+                raise ValueError(
+                    f"engine '{engine_name}' /usr/bin/env split string is invalid: {exc}"
+                ) from exc
+            pending[index : index + 1] = split_arguments
+            continue
+        if argument.startswith("-"):
+            raise ValueError(
+                f"engine '{engine_name}' uses unsupported /usr/bin/env flag: {argument}"
+            )
+        break
+    if index >= len(pending) or not pending[index].strip():
+        raise ValueError(f"engine '{engine_name}' /usr/bin/env launch has no child executable")
+    return pending[index], alternate_search_path or environment_search_path
+
+
+def resolved_executable(
+    executable: str,
+    *,
+    search_path: str,
+    engine_name: str,
+    declaration: str,
+) -> Path:
+    validate_executable_declaration(executable, key=f"engines.{engine_name}.{declaration}")
+    if os.sep in executable:
+        found = Path(executable).expanduser()
+        resolved = found.resolve()
+        missing = not (found.is_file() and os.access(found, os.X_OK))
+    else:
+        located = shutil.which(executable, path=search_path)
+        resolved = Path(located).resolve() if located else Path(executable)
+        missing = located is None
+    if missing:
+        hint = ENGINE_INSTALL_HINTS.get(
+            engine_name,
+            f"install it or fix engines.{engine_name}.{declaration} in config.toml",
+        )
+        label = "binary" if declaration == "bin" else declaration.replace("_", " ")
+        raise ValueError(f"engine '{engine_name}' {label} not found ({executable}) — {hint}")
+    return resolved
+
+
 def preflight_engine_bins(manifest: Manifest, config: AppConfig) -> None:
-    """Fail before spawning anything if a worker binary is missing.
+    """Bind preflight to the exact worker executable before spawning tasks.
 
     Without this, a fresh install dies mid-run with a bare
     "worker spawn failed: [Errno 2]" in the task log — the least helpful
@@ -8016,43 +8245,70 @@ def preflight_engine_bins(manifest: Manifest, config: AppConfig) -> None:
         engine = config.engines.get(name)
         if engine is None:
             continue  # validate_manifest_engines already rejected this
-        if Path(engine.bin).name == "env" and not engine.preflight_executables:
+        uses_env = Path(engine.bin).name == "env"
+        if uses_env and engine.worker_executable is None:
             raise ValueError(
                 f"engine '{name}' uses {engine.bin} and must declare "
-                f"engines.{name}.preflight_executables"
+                f"engines.{name}.worker_executable"
             )
         worker_environment = build_worker_environment(engine)
         search_path = worker_environment.get("PATH", os.defpath)
-        declarations = (("binary", engine.bin),) + tuple(
-            ("preflight executable", executable)
-            for executable in engine.preflight_executables
+        launched_bin = resolved_executable(
+            engine.bin,
+            search_path=search_path,
+            engine_name=name,
+            declaration="bin",
         )
-        checked: set[str] = set()
-        for declaration, executable in declarations:
+        declared_worker = engine.worker_executable or engine.bin
+        declared_identity = resolved_executable(
+            declared_worker,
+            search_path=search_path,
+            engine_name=name,
+            declaration="worker_executable",
+        )
+        tasks = [task for task in manifest.tasks if task.engine == name]
+        launched_identities: set[Path] = set()
+        for task in tasks:
+            if uses_env:
+                command = build_worker_command(
+                    engine,
+                    taskdir=manifest.workdir / task.key,
+                    spec=task.spec,
+                    full_access=task.full_access,
+                    engine_args=task.engine_args,
+                    model=task.model,
+                )
+                child, child_search_path = env_child_executable(
+                    command[1:],
+                    engine_name=name,
+                    default_search_path=search_path,
+                )
+                launched_identity = resolved_executable(
+                    child,
+                    search_path=child_search_path,
+                    engine_name=name,
+                    declaration="worker_executable",
+                )
+            else:
+                launched_identity = launched_bin
+            launched_identities.add(launched_identity)
+        if launched_identities != {declared_identity}:
+            launched = ", ".join(str(path) for path in sorted(launched_identities))
+            raise ValueError(
+                f"engine '{name}' worker executable mismatch: declaration resolves to "
+                f"{declared_identity}, but launch resolves to {launched}"
+            )
+        checked = {engine.bin, declared_worker}
+        for executable in engine.preflight_executables:
             if executable in checked:
                 continue
             checked.add(executable)
-            validate_executable_declaration(
+            resolved_executable(
                 executable,
-                key=(
-                    f"engines.{name}.bin"
-                    if declaration == "binary"
-                    else f"engines.{name}.preflight_executables"
-                ),
+                search_path=search_path,
+                engine_name=name,
+                declaration="preflight_executables",
             )
-            if os.sep in executable:
-                found = Path(executable).expanduser()
-                missing = not (found.is_file() and os.access(found, os.X_OK))
-            else:
-                missing = shutil.which(executable, path=search_path) is None
-            if missing:
-                hint = ENGINE_INSTALL_HINTS.get(
-                    name,
-                    f"install it or fix engines.{name}.{('bin' if declaration == 'binary' else 'preflight_executables')} in config.toml",
-                )
-                raise ValueError(
-                    f"engine '{name}' {declaration} not found ({executable}) — {hint}"
-                )
 
 
 def validate_manifest_engines(manifest: Manifest, config: AppConfig) -> None:
@@ -8439,7 +8695,11 @@ def print_lint_findings(findings: list[str]) -> None:
         print(f"lint: {finding}")
 
 
-def print_summary(run_id: str, runtimes: list[TaskRuntime]) -> None:
+def print_summary(
+    run_id: str,
+    runtimes: list[TaskRuntime],
+    engines: Mapping[str, EngineConfig] | None = None,
+) -> None:
     print("\nSummary")
     print(f"run_id: {run_id}")
     header = f"{'task':<24} {'status':<8} {'verdict':<8} {'attempts':>8} {'tokens':>10} {'elapsed_s':>10}"
@@ -8459,6 +8719,24 @@ def print_summary(run_id: str, runtimes: list[TaskRuntime]) -> None:
             f"{(runtime.final_verdict or ''):<8} {runtime.attempts:>8} "
             f"{tokens:>10} {runtime.elapsed_s(now):>10.1f}"
         )
+        engine = engines.get(runtime.task.engine) if engines is not None else None
+        accountability_parts: list[str] = []
+        if runtime.status == "pass" and runtime.attempts > 1:
+            accountability_parts.append("Passed after retry")
+        accountability_parts.append(
+            "Configured access: "
+            + access_accounting_text(
+                engine.access_class if engine else None,
+                engine.access_label if engine else None,
+            )
+        )
+        blocked_text = blocked_accounting_text(
+            runtime.blocked_kind,
+            runtime.blocked_reason,
+        )
+        if blocked_text:
+            accountability_parts.append(blocked_text)
+        print("    " + " · ".join(accountability_parts))
 
 
 def create_demo_manifest() -> Path:
