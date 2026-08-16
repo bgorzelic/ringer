@@ -152,16 +152,25 @@ class RingsideAccountabilityTests(unittest.TestCase):
         self.assertIn("setHidden(record.elements.access, runAccess === null);", update_run_fn)
 
     def test_blocked_reason_rendered_in_drawer_without_raw_log_lookup(self) -> None:
-        self.assertIn("function blockedReasonLabel(task) {", self.script)
+        self.assertIn("function blockedLabel(task) {", self.script)
         self.assertIn('<div class="drawer-blocked" data-drawer-blocked hidden></div>', self.script)
         drawer_fn = self._extract_function("updateDrawerContent")
-        self.assertIn("const blocked = blockedReasonLabel(task);", drawer_fn)
-        self.assertIn('setText(refs.blocked, blocked ? `blocked: ${blocked}` : "");', drawer_fn)
+        self.assertIn("const blocked = blockedLabel(task);", drawer_fn)
+        self.assertIn('setText(refs.blocked, blocked || "");', drawer_fn)
 
     def test_blocked_badge_also_surfaced_on_the_task_card(self) -> None:
         update_fn = self._extract_function("updateTaskRecord")
-        self.assertIn("const blocked = blockedReasonLabel(task);", update_fn)
+        self.assertIn("const blocked = blockedLabel(task);", update_fn)
         self.assertIn("setHidden(record.elements.blocked, blocked === null);", update_fn)
+
+    def test_blocked_kind_never_parsed_out_of_reason_text(self) -> None:
+        # blockedLabel must read task.blocked_kind directly and must never run any kind
+        # of text search/parse over blocked_reason to guess a kind.
+        blocked_fn = self._extract_function("blockedLabel")
+        self.assertIn("task?.blocked_kind", blocked_fn)
+        self.assertNotIn(".match(", blocked_fn)
+        self.assertNotIn(".exec(", blocked_fn)
+        self.assertNotIn(".includes(", blocked_fn)
 
     # -- regression guards for untouched behavior ------------------------------
 

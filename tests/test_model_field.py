@@ -2,6 +2,8 @@
 """Per-task model routing: the {model} placeholder, model_default, validation."""
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -18,6 +20,7 @@ from ringer import (  # noqa: E402
     Manifest,
     TaskSpec,
     build_worker_command,
+    env_child_executable,
     load_engines,
     preflight_engine_bins,
     validate_manifest_engines,
@@ -294,6 +297,108 @@ class ModelValidationTests(unittest.TestCase):
             self.manifest(self.base_task(engine="wrapped")),
             self.config({"wrapped": wrapped}),
         )
+
+    @unittest.skipUnless(Path("/usr/bin/env").is_file(), "requires platform /usr/bin/env")
+    def test_env_parser_matches_platform_option_and_assignment_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            bin_dir = Path(temp)
+            probes = {
+                "probe": "#!/bin/sh\nprintf 'probe:%s\\n' \"$MARKER\"\n",
+                "-u": "#!/bin/sh\nprintf 'dash-child\\n'\n",
+            }
+            for name, source in probes.items():
+                path = bin_dir / name
+                path.write_text(source, encoding="utf-8")
+                path.chmod(0o755)
+
+            cases = (
+                (
+                    "options before assignments",
+                    ("-i", "-u", "MARKER", f"PATH={bin_dir}", "MARKER=one", "probe"),
+                    "probe",
+                    "probe:one\n",
+                ),
+                (
+                    "first non-assignment is a dash-prefixed child",
+                    (
+                        "-i",
+                        f"PATH={bin_dir}",
+                        "MARKER=one",
+                        "-u",
+                        "MARKER",
+                        "/bin/sh",
+                    ),
+                    "-u",
+                    "dash-child\n",
+                ),
+                (
+                    "assignments after option terminator",
+                    ("-i", "--", f"PATH={bin_dir}", "MARKER=two", "probe"),
+                    "probe",
+                    "probe:two\n",
+                ),
+            )
+            for label, arguments, expected_child, expected_stdout in cases:
+                with self.subTest(label=label):
+                    child, search_path = env_child_executable(
+                        arguments,
+                        engine_name="wrapped",
+                        default_search_path=os.defpath,
+                    )
+                    completed = subprocess.run(
+                        ["/usr/bin/env", *arguments],
+                        check=False,
+                        capture_output=True,
+                        text=True,
+                        env={"PATH": os.defpath},
+                    )
+                    self.assertEqual(0, completed.returncode, completed.stderr)
+                    self.assertEqual(expected_stdout, completed.stdout)
+                    self.assertEqual(expected_child, child)
+                    self.assertEqual(str(bin_dir), search_path)
+
+    @unittest.skipUnless(Path("/usr/bin/env").is_file(), "requires platform /usr/bin/env")
+    def test_preflight_does_not_skip_dash_child_after_assignments(self) -> None:
+        arguments = (
+            "-i",
+            "PATH=/usr/bin:/bin",
+            "MARKER=1",
+            "-u",
+            "MARKER",
+            "/bin/sh",
+            "-c",
+            "exit 0",
+        )
+        completed = subprocess.run(
+            ["/usr/bin/env", *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={"PATH": os.defpath},
+        )
+        self.assertNotEqual(0, completed.returncode)
+        self.assertIn("-u", completed.stderr)
+
+        wrapped = EngineConfig(
+            name="wrapped",
+            bin="/usr/bin/env",
+            args_template=arguments,
+            full_access_args=(),
+            sandbox_args=(),
+            token_regex=None,
+            env_allowlist=("PATH",),
+            worker_executable="/bin/sh",
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            r"worker executable not found \(-u\)",
+        ) as raised:
+            preflight_engine_bins(
+                self.manifest(self.base_task(engine="wrapped")),
+                self.config({"wrapped": wrapped}),
+            )
+        self.assertNotIn("MARKER=1", str(raised.exception))
+        self.assertNotIn("exit 0", str(raised.exception))
 
     def test_preflight_rejects_env_child_declaration_mismatch(self) -> None:
         wrapped = EngineConfig(

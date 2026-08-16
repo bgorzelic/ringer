@@ -8127,12 +8127,8 @@ def env_child_executable(
         if argument == "--":
             index += 1
             break
-        assignment = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", argument)
-        if assignment:
-            if assignment.group(1) == "PATH":
-                environment_search_path = assignment.group(2)
-            index += 1
-            continue
+        if re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", argument):
+            break
         if re.fullmatch(r"-[iv0]+", argument) or argument in {
             "--ignore-environment",
             "--null",
@@ -8203,6 +8199,16 @@ def env_child_executable(
                 f"engine '{engine_name}' uses unsupported /usr/bin/env flag: {argument}"
             )
         break
+    # env accepts assignments only after option parsing has stopped. Once this
+    # phase begins, the first non-assignment is the child even when it starts
+    # with a dash.
+    while index < len(pending):
+        assignment = re.fullmatch(r"([A-Za-z_][A-Za-z0-9_]*)=(.*)", pending[index])
+        if assignment is None:
+            break
+        if assignment.group(1) == "PATH":
+            environment_search_path = assignment.group(2)
+        index += 1
     if index >= len(pending) or not pending[index].strip():
         raise ValueError(f"engine '{engine_name}' /usr/bin/env launch has no child executable")
     return pending[index], alternate_search_path or environment_search_path
@@ -8260,16 +8266,12 @@ def preflight_engine_bins(manifest: Manifest, config: AppConfig) -> None:
             declaration="bin",
         )
         declared_worker = engine.worker_executable or engine.bin
-        declared_identity = resolved_executable(
-            declared_worker,
-            search_path=search_path,
-            engine_name=name,
-            declaration="worker_executable",
+        tasks = sorted(
+            (task for task in manifest.tasks if task.engine == name),
+            key=lambda task: task.key,
         )
-        tasks = [task for task in manifest.tasks if task.engine == name]
-        launched_identities: set[Path] = set()
-        for task in tasks:
-            if uses_env:
+        if uses_env:
+            for task in tasks:
                 command = build_worker_command(
                     engine,
                     taskdir=manifest.workdir / task.key,
@@ -8289,15 +8291,30 @@ def preflight_engine_bins(manifest: Manifest, config: AppConfig) -> None:
                     engine_name=name,
                     declaration="worker_executable",
                 )
-            else:
-                launched_identity = launched_bin
-            launched_identities.add(launched_identity)
-        if launched_identities != {declared_identity}:
-            launched = ", ".join(str(path) for path in sorted(launched_identities))
-            raise ValueError(
-                f"engine '{name}' worker executable mismatch: declaration resolves to "
-                f"{declared_identity}, but launch resolves to {launched}"
+                declared_identity = resolved_executable(
+                    declared_worker,
+                    search_path=child_search_path,
+                    engine_name=name,
+                    declaration="worker_executable",
+                )
+                if launched_identity != declared_identity:
+                    raise ValueError(
+                        f"engine '{name}' task '{task.key}' worker executable mismatch: "
+                        f"declaration resolves to {declared_identity}, but launch resolves to "
+                        f"{launched_identity}"
+                    )
+        else:
+            declared_identity = resolved_executable(
+                declared_worker,
+                search_path=search_path,
+                engine_name=name,
+                declaration="worker_executable",
             )
+            if launched_bin != declared_identity:
+                raise ValueError(
+                    f"engine '{name}' worker executable mismatch: declaration resolves to "
+                    f"{declared_identity}, but launch resolves to {launched_bin}"
+                )
         checked = {engine.bin, declared_worker}
         for executable in engine.preflight_executables:
             if executable in checked:

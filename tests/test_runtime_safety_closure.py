@@ -388,6 +388,57 @@ class ExecutableDeclarationTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "slash-containing relative paths"):
                 preflight_engine_bins(manifest, test_config(root, engine))
 
+    def test_env_declaration_uses_inline_path_from_task_engine_args(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bin_dir = root / "inline-bin"
+            bin_dir.mkdir()
+            (bin_dir / "declared-worker").symlink_to("/bin/sh")
+            (bin_dir / "selected-worker").symlink_to("/bin/sh")
+            engine = EngineConfig(
+                name="test",
+                bin="/usr/bin/env",
+                args_template=("{engine_args}", "{spec}"),
+                full_access_args=(),
+                sandbox_args=(),
+                token_regex=None,
+                env_allowlist=(),
+                worker_executable="declared-worker",
+            )
+            task = task_obj()
+            task["engine_args"] = [f"PATH={bin_dir}", "selected-worker"]
+            manifest = Manifest.from_obj(manifest_obj(root, [task]))
+
+            preflight_engine_bins(manifest, test_config(root, engine))
+
+    def test_env_preflight_checks_multiple_tasks_in_key_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            bin_dir = root / "inline-bin"
+            bin_dir.mkdir()
+            (bin_dir / "inline-worker").symlink_to("/bin/sh")
+            engine = EngineConfig(
+                name="test",
+                bin="/usr/bin/env",
+                args_template=("{engine_args}", "{spec}"),
+                full_access_args=(),
+                sandbox_args=(),
+                token_regex=None,
+                env_allowlist=(),
+                worker_executable="inline-worker",
+            )
+            later_mismatch = task_obj("z-mismatched")
+            later_mismatch["engine_args"] = [f"PATH={bin_dir}", "/usr/bin/false"]
+            mismatched = task_obj("a-mismatched")
+            mismatched["engine_args"] = [f"PATH={bin_dir}", "/usr/bin/true"]
+            manifest = Manifest.from_obj(manifest_obj(root, [later_mismatch, mismatched]))
+
+            with self.assertRaisesRegex(
+                ValueError,
+                r"task 'a-mismatched' worker executable mismatch",
+            ):
+                preflight_engine_bins(manifest, test_config(root, engine))
+
 
 class ContentFreshnessTests(unittest.IsolatedAsyncioTestCase):
     async def test_touch_and_identical_rewrite_stay_stale_but_new_bytes_are_fresh(self) -> None:

@@ -65,7 +65,7 @@ class RingsideFinalAccountabilityTests(unittest.TestCase):
             _extract_function(cls.script, "formatCount"),
             _extract_function(cls.script, "optionalMetaLabel"),
             _extract_function(cls.script, "accessLabel"),
-            _extract_function(cls.script, "blockedReasonLabel"),
+            _extract_function(cls.script, "blockedLabel"),
             _extract_function(cls.script, "escapeHtml"),
             _extract_const(cls.script, "PROVEN_MIN_TASKS"),
             _extract_const(cls.script, "PROVEN_MIN_FIRST_TRY_PASS_RATE"),
@@ -187,8 +187,19 @@ class RingsideFinalAccountabilityTests(unittest.TestCase):
     def test_blocked_reason_passes_malicious_text_through_unescaped(self) -> None:
         malicious = "\"><script>alert(1)</script>"
         self.assertEqual(
-            self._call("blockedReasonLabel", {"blocked_reason": malicious}),
-            malicious,
+            self._call("blockedLabel", {"blocked_reason": malicious}),
+            f"blocked: {malicious}",
+        )
+
+    def test_blocked_kind_and_reason_both_pass_malicious_text_through_unescaped(self) -> None:
+        malicious_kind = "<img src=x onerror=alert(2)>"
+        malicious_reason = "\"><script>alert(1)</script>"
+        self.assertEqual(
+            self._call(
+                "blockedLabel",
+                {"blocked_kind": malicious_kind, "blocked_reason": malicious_reason},
+            ),
+            f"blocked ({malicious_kind}): {malicious_reason}",
         )
 
     def test_escape_html_neutralizes_the_same_malicious_payloads(self) -> None:
@@ -201,10 +212,74 @@ class RingsideFinalAccountabilityTests(unittest.TestCase):
         self.assertIn("&lt;img", escaped)
 
     def test_blocked_reason_empty_string_still_labeled_not_dropped(self) -> None:
-        self.assertEqual(self._call("blockedReasonLabel", {"blocked_reason": ""}), "unknown")
+        self.assertEqual(self._call("blockedLabel", {"blocked_reason": ""}), "blocked: unknown")
 
     def test_blocked_reason_absent_is_null(self) -> None:
-        self.assertIsNone(self._call("blockedReasonLabel", {}))
+        self.assertIsNone(self._call("blockedLabel", {}))
+
+    # -- blockedLabel: legacy vs. kind-aware forms (executable) -----------------
+
+    def test_blocked_label_both_fields_absent_is_null(self) -> None:
+        # No blocking info reported at all -- nothing renders, layout is preserved.
+        self.assertIsNone(self._call("blockedLabel", {}))
+
+    def test_blocked_label_legacy_payload_with_only_reason_uses_conservative_form(self) -> None:
+        # An older Ringer server that never reported blocked_kind must keep reading as
+        # the plain "blocked: reason" form it always used.
+        self.assertEqual(
+            self._call("blockedLabel", {"blocked_reason": "Worker timed out."}),
+            "blocked: Worker timed out.",
+        )
+
+    def test_blocked_label_every_blocked_kind_matches_terminal_static_form(self) -> None:
+        # Mirrors ringer.py's worker_blocked_reason()/blocked_accounting_text() pairing
+        # for every BlockedKind so the live dashboard matches the terminal/static report.
+        kind_reasons = {
+            "configuration": "Worker configuration prevented this task from starting.",
+            "preparation": "Task preparation failed.",
+            "spawn": "Worker process could not be started.",
+            "cancelled": "Task was cancelled before completion.",
+            "runner": "Runner stopped before task completion.",
+        }
+        for kind, reason in kind_reasons.items():
+            with self.subTest(blocked_kind=kind):
+                self.assertEqual(
+                    self._call(
+                        "blockedLabel",
+                        {"blocked_kind": kind, "blocked_reason": reason},
+                    ),
+                    f"blocked ({kind}): {reason}",
+                )
+
+    def test_blocked_label_kind_present_reason_missing_reads_unknown(self) -> None:
+        # A present blocked_kind with no reason must still read as unknown, not vanish
+        # or silently drop the kind information that is known.
+        self.assertEqual(
+            self._call("blockedLabel", {"blocked_kind": "spawn"}),
+            "blocked (spawn): unknown",
+        )
+
+    def test_blocked_label_kind_present_but_empty_reads_unknown(self) -> None:
+        self.assertEqual(
+            self._call("blockedLabel", {"blocked_kind": "", "blocked_reason": "x"}),
+            "blocked (unknown): x",
+        )
+
+    def test_blocked_label_both_present_but_empty_read_unknown(self) -> None:
+        self.assertEqual(
+            self._call("blockedLabel", {"blocked_kind": "", "blocked_reason": ""}),
+            "blocked (unknown): unknown",
+        )
+
+    def test_blocked_label_never_infers_kind_from_reason_prose(self) -> None:
+        # blocked_reason text that looks like it embeds a kind (parenthetical, "kind="
+        # markers, etc.) must never be parsed into a kind -- only an explicit
+        # blocked_kind field can produce the parenthetical form.
+        sneaky_reason = "blocked (spawn): kind=configuration injected into reason text"
+        self.assertEqual(
+            self._call("blockedLabel", {"blocked_reason": sneaky_reason}),
+            f"blocked: {sneaky_reason}",
+        )
 
     # -- local tier threshold: proven only at >=3 tasks and >=0.67 first-try ----
 
@@ -308,8 +383,8 @@ class RingsideFinalAccountabilityTests(unittest.TestCase):
         update_fn = self._extract_top_level_function("updateTaskRecord")
         self.assertIn("task.attempts", update_fn)
         self.assertIn("accessLabel(task)", update_fn)
-        self.assertIn("blockedReasonLabel(task)", update_fn)
-        for fn_name in ("isTokensUnknown", "isTokensPartial", "accessLabel"):
+        self.assertIn("blockedLabel(task)", update_fn)
+        for fn_name in ("isTokensUnknown", "isTokensPartial", "accessLabel", "blockedLabel"):
             fn_src = self._extract_top_level_function(fn_name)
             self.assertIn("?.", fn_src, f"{fn_name} must optional-chain into its source object")
         # optionalMetaLabel takes the raw value directly (not a source object), so it

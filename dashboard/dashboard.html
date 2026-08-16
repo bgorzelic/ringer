@@ -1203,8 +1203,20 @@
       return label ? `${base} — ${label}` : base;
     }
 
-    function blockedReasonLabel(task) {
-      return optionalMetaLabel(task?.blocked_reason);
+    // Kind comes only from task.blocked_kind -- it is never inferred from the prose in
+    // blocked_reason. A legacy payload that never reported blocked_kind keeps the
+    // conservative "blocked: reason" form it always had; once blocked_kind is present
+    // (even empty) the richer "blocked (kind): reason" form from the terminal/static
+    // renderer is used, and a missing reason alongside a present kind reads as unknown
+    // rather than disappearing.
+    function blockedLabel(task) {
+      const kindRaw = task?.blocked_kind;
+      const reasonRaw = task?.blocked_reason;
+      if (kindRaw === undefined && reasonRaw === undefined) return null;
+      const reasonLabel = optionalMetaLabel(reasonRaw) ?? "unknown";
+      if (kindRaw === undefined) return `blocked: ${reasonLabel}`;
+      const kindLabel = optionalMetaLabel(kindRaw) ?? "unknown";
+      return `blocked (${kindLabel}): ${reasonLabel}`;
     }
 
     function fmtElapsed(seconds) {
@@ -1657,7 +1669,7 @@
       const selected = openTaskRef?.runKey === runRecord.key && openTaskRef?.taskKey === record.key;
       const taskClass = `task ${safeClass(status, "queued")}${passedAfterRetry ? " retried" : ""}${selected ? " selected" : ""}`;
       const taskAccess = accessLabel(task);
-      const blocked = blockedReasonLabel(task);
+      const blocked = blockedLabel(task);
 
       record.task = task;
       record.runRecord = runRecord;
@@ -1675,8 +1687,8 @@
       setHidden(record.elements.access, taskAccess === null);
       setText(record.elements.access, taskAccess ? `access ${taskAccess}` : "");
       setHidden(record.elements.blocked, blocked === null);
-      setText(record.elements.blocked, blocked ? `blocked: ${blocked}` : "");
-      setTitle(record.elements.blocked, blocked ? `blocked: ${blocked}` : "");
+      setText(record.elements.blocked, blocked || "");
+      setTitle(record.elements.blocked, blocked || "");
 
       if (selected) updateDrawerContent(runRecord, run, task);
     }
@@ -1729,7 +1741,7 @@
       if (taskAccess) metaParts.push(`access ${taskAccess}`);
       if (status === "pass" && attempts > 1) metaParts.push("passed after retry");
       const meta = metaParts.join(" · ");
-      const blocked = blockedReasonLabel(task);
+      const blocked = blockedLabel(task);
       const configHtml = [
         `<div class="drawer-links">${links}</div>`,
         `<div class="drawer-label">Prompt</div>`,
@@ -1744,7 +1756,7 @@
       setText(refs.status, status);
       setText(refs.meta, meta);
       setHidden(refs.blocked, blocked === null);
-      setText(refs.blocked, blocked ? `blocked: ${blocked}` : "");
+      setText(refs.blocked, blocked || "");
       if (refs.configBody.innerHTML !== configHtml) refs.configBody.innerHTML = configHtml;
       syncWorkerLogPanel(run, task, refs.stream);
     }
