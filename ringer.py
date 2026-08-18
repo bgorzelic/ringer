@@ -5997,6 +5997,37 @@ def model_log_row_is_reserved_fixture(row: dict[str, Any]) -> bool:
     return model_log_text(row.get("model")) in RESERVED_FIXTURE_MODELS
 
 
+def model_log_row_counts_toward_score(row: dict[str, Any]) -> bool:
+    """Whether a row is evidence about the model, or merely a run that happened.
+
+    A producer may set ``counts_toward_score: false`` on a row whose worker
+    never got as far as doing the work it was dispatched for - the usual case
+    being credit or quota exhaustion, where the CLI exits in a few seconds
+    having read nothing and written nothing. Scored as a failed task, a run
+    like that says something about the account's billing state and nothing
+    whatsoever about the model, and at one dispatch every five minutes it
+    buries the runs that do: on the box this was written for, 197 of one
+    lane's 203 tasks were a single 11-hour exhaustion window, and the
+    scoreboard reported a 3% pass rate for a model that had in fact passed
+    almost everything it was able to start.
+
+    Absent or unparseable means TRUE. The field can only ever exclude a row
+    that explicitly asks to be excluded, so a producer that knows nothing
+    about it - which is every producer today - is unaffected, and a typo
+    leaves a row counting rather than silently vanishing from the score.
+    """
+    value = row.get("counts_toward_score")
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() not in {"false", "0", "no"}
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return True
+
+
 def model_reasoning_effort_keys(rows: list[dict[str, Any]]) -> set[tuple[str, str, bool]]:
     keys: set[tuple[str, str, bool]] = set()
     for row in rows:
@@ -6163,6 +6194,7 @@ def aggregate_model_log_rows(
                 "attempts": 0,
                 "passed": 0,
                 "failed": 0,
+                "not_scored": 0,
                 "pass_rate": 0.0,
                 "first_try_pass_rate": 0.0,
                 "median_duration_ms": None,
@@ -6173,6 +6205,19 @@ def aggregate_model_log_rows(
                 "_tokens": [],
             },
         )
+        # `last_seen` is updated for every task, scored or not: a lane that
+        # spent all week unable to start has still been running, and showing it
+        # as untouched since last month would be its own kind of lie.
+        logged_at = model_log_text(final.get("logged_at"))
+        if logged_at > group["last_seen"]:
+            group["last_seen"] = logged_at
+        if not model_log_row_counts_toward_score(final):
+            # Counted, never scored. Duration and tokens are excluded too - a
+            # run that died on startup contributes a 4-second, zero-token
+            # sample that drags both medians toward a number no real run ever
+            # produced.
+            group["not_scored"] += 1
+            continue
         group["tasks"] += 1
         group["attempts"] += len(ordered)
         if model_log_text(final.get("verdict")).upper() == "PASS":
@@ -6188,9 +6233,6 @@ def aggregate_model_log_rows(
             tokens = model_log_int(row.get("worker_tokens"))
             if tokens is not None:
                 group["_tokens"].append(tokens)
-        logged_at = model_log_text(final.get("logged_at"))
-        if logged_at > group["last_seen"]:
-            group["last_seen"] = logged_at
 
     finalized: list[dict[str, Any]] = []
     for group in groups.values():
@@ -6213,6 +6255,7 @@ def aggregate_model_log_rows(
                 "attempts": group["attempts"],
                 "passed": group["passed"],
                 "failed": group["failed"],
+                "not_scored": group["not_scored"],
                 "pass_rate": group["pass_rate"],
                 "first_try_pass_rate": group["first_try_pass_rate"],
                 "median_duration_ms": group["median_duration_ms"],
@@ -6706,6 +6749,7 @@ def create_read_model_schema(conn: Any) -> None:
             verdict TEXT,
             duration_ms INTEGER,
             worker_tokens INTEGER,
+            counts_toward_score INTEGER,
             orchestrator TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_attempts_model_task_type
@@ -6763,6 +6807,11 @@ def create_read_model_schema(conn: Any) -> None:
         conn.execute("ALTER TABLE attempts ADD COLUMN reported_model TEXT")
     if not read_model_column_exists(conn, "attempts", "expected_model"):
         conn.execute("ALTER TABLE attempts ADD COLUMN expected_model TEXT")
+    # Additive and nullable, so schema_version stays at 3: every SELECT names
+    # its columns, and NULL reads back as "counts", which is the same answer an
+    # older database gives for a row that predates the field.
+    if not read_model_column_exists(conn, "attempts", "counts_toward_score"):
+        conn.execute("ALTER TABLE attempts ADD COLUMN counts_toward_score INTEGER")
     if not read_model_column_exists(conn, "identity", "lab"):
         conn.execute("ALTER TABLE identity ADD COLUMN lab TEXT")
     if not read_model_column_exists(conn, "identity", "alias"):
@@ -6868,6 +6917,7 @@ def insert_attempt_rows(conn: Any, rows: list[dict[str, Any]]) -> int:
                 model_log_text(row.get("verdict")),
                 model_log_int(row.get("duration_ms")),
                 model_log_int(row.get("worker_tokens")),
+                1 if model_log_row_counts_toward_score(row) else 0,
                 model_log_text(row.get("orchestrator")),
             )
         )
@@ -6877,9 +6927,9 @@ def insert_attempt_rows(conn: Any, rows: list[dict[str, Any]]) -> int:
             INSERT INTO attempts (
                 run_id, task_key, logged_at, engine, model, reported_model, expected_model,
                 reasoning_effort, task_type, retry,
-                verdict, duration_ms, worker_tokens, orchestrator
+                verdict, duration_ms, worker_tokens, counts_toward_score, orchestrator
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             payloads,
         )
@@ -7193,7 +7243,7 @@ def db_attempt_rows(
         query = """
             SELECT run_id, task_key, logged_at, engine, model, reported_model, expected_model,
                    reasoning_effort, task_type, retry,
-                   verdict, duration_ms, worker_tokens, orchestrator
+                   verdict, duration_ms, worker_tokens, counts_toward_score, orchestrator
             FROM attempts
         """
         params: list[Any] = []
@@ -7216,6 +7266,12 @@ def db_attempt_rows(
                 "verdict": row["verdict"],
                 "duration_ms": row["duration_ms"],
                 "worker_tokens": row["worker_tokens"],
+                # NULL means the row predates the column, which must read as
+                # "counts" - the same answer the JSONL path gives for a row
+                # with no such field.
+                "counts_toward_score": (
+                    True if row["counts_toward_score"] is None else bool(row["counts_toward_score"])
+                ),
                 "orchestrator": row["orchestrator"],
             }
             for row in conn.execute(query, params)
@@ -7599,6 +7655,7 @@ def aggregate_model_scoreboard_rows(
                 "attempts": 0,
                 "passed": 0,
                 "failed": 0,
+                "not_scored": 0,
                 "retries": 0,
                 "first_try_passed": 0,
                 "last_seen": "",
@@ -7615,10 +7672,21 @@ def aggregate_model_scoreboard_rows(
                 "attempts": 0,
                 "passed": 0,
                 "failed": 0,
+                "not_scored": 0,
                 "first_try_passed": 0,
                 "last_seen": "",
             },
         )
+        # Same rule as aggregate_model_log_rows. Patching only one aggregator
+        # would leave the HTML scoreboard reporting the numbers the CLI table
+        # had just stopped reporting.
+        if not model_log_row_counts_toward_score(final):
+            for target in (model_entry, breakdown):
+                target["not_scored"] += 1
+                logged_at = model_log_text(final.get("logged_at"))
+                if logged_at > target["last_seen"]:
+                    target["last_seen"] = logged_at
+            continue
         passed = model_log_text(final.get("verdict")).upper() == "PASS"
         first_passed = model_log_text(first.get("verdict")).upper() == "PASS"
         for target in (model_entry, breakdown):
@@ -8495,7 +8563,8 @@ def write_model_scoreboard_html(
 
 def print_model_log_table(path: Path, rows_read: int, skipped: int, groups: list[dict[str, Any]]) -> None:
     print(f"Model log: {path} ({rows_read} rows, {skipped} skipped lines)")
-    widths = (32, 20, 18, 18, 10, 7, 10, 7, 15, 15, 14, 14, 60)
+# Tasks widened from 7 to 18 to fit "6 (+197 no-op)".
+    widths = (32, 20, 18, 18, 10, 18, 10, 7, 15, 15, 14, 14, 60)
     header = " | ".join(
         f"{name:<{width}}" for name, width in zip(MODEL_SCOREBOARD_COLUMNS, widths)
     )
@@ -8519,15 +8588,26 @@ def print_model_log_table(path: Path, rows_read: int, skipped: int, groups: list
             display = f"{display} [misrouted]"
         if group.get("unregistered"):
             display = f"{display} [unregistered]"
+        # Scored tasks, then how many were counted but not scored. Without the
+        # second half a lane that mostly could not start looks simply idle,
+        # and the reader has no way to tell "6 tasks" from "6 tasks out of 203
+        # dispatches". With tasks==0 the rates are blank rather than 0%, which
+        # would read as "tried and failed everything" instead of "never
+        # actually started".
+        scored = group.get("tasks") or 0
+        not_scored = group.get("not_scored") or 0
+        tasks_cell = fmt_int(scored)
+        if not_scored:
+            tasks_cell = f"{tasks_cell} (+{fmt_int(not_scored)} no-op)"
         values = (
             display,
             str(group.get("lab") or "(unknown)"),
             str(group.get("harness") or "unknown"),
             str(group.get("access") or "unknown"),
             "not ranked" if group.get("tier") == "unranked" else str(group.get("tier") or ""),
-            fmt_int(group.get("tasks")),
-            fmt_percent(group.get("first_try_pass_rate")),
-            fmt_percent(group.get("pass_rate")),
+            tasks_cell,
+            fmt_percent(group.get("first_try_pass_rate")) if scored else "",
+            fmt_percent(group.get("pass_rate")) if scored else "",
             "" if group.get("median_tokens") is None else fmt_int(group.get("median_tokens")),
             str(group.get("task_cost_label") or ""),
             fmt_scoreboard_duration(group.get("median_duration_ms")),
