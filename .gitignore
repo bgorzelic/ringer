@@ -10,3 +10,7 @@ hud/dist/
 hud/gen/
 hud/icons/icon.iconset/
 *.log
+
+# Ad-hoc run manifests — personal scratch, point at /tmp
+/swarm*.json
+/proof-*.json
