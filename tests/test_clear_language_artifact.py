@@ -13,7 +13,7 @@ sys.path.insert(0, str(ROOT))
 from ringer import ArtifactRenderer, render_final_report_html, render_status_html  # noqa: E402
 
 
-class PlainEnglishArtifactTests(unittest.TestCase):
+class ClearLanguageArtifactTests(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
@@ -44,7 +44,7 @@ class PlainEnglishArtifactTests(unittest.TestCase):
         running_n = sum(1 for task in tasks if task["status"] in {"running", "verifying", "retrying"})
         return {
             "run_id": "run-123",
-            "run_name": "Plain English Run",
+            "run_name": "Clear Language Run",
             "identity": "claude-code-mbp",
             "state": "finished" if finished else "live",
             "started_at": "2026-07-05T00:00:00+00:00",
@@ -91,7 +91,7 @@ class PlainEnglishArtifactTests(unittest.TestCase):
         self.assertRegex(
             html,
             r'(?s)<div class="page">\s*<header class="corner">.*?'
-            r'<span class="eyebrow">Ringer &nbsp;·&nbsp; <b>Plain English Run</b>.*?'
+            r'<span class="eyebrow">Ringer &nbsp;·&nbsp; <b>Clear Language Run</b>.*?'
             r'<h1 id="right-now-heading" class="briefing">',
         )
 
