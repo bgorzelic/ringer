@@ -32,7 +32,7 @@ LONG_SPEC = (
 )
 
 
-def test_config(root: Path) -> AppConfig:
+def make_config(root: Path) -> AppConfig:
     engine = EngineConfig(
         name="test",
         bin=sys.executable,
@@ -60,7 +60,7 @@ def test_config(root: Path) -> AppConfig:
     )
 
 
-def test_manifest(root: Path, keys: tuple[str, ...] = ("one",)) -> Manifest:
+def make_manifest(root: Path, keys: tuple[str, ...] = ("one",)) -> Manifest:
     return Manifest.from_obj(
         {
             "run_name": "runner-lifecycle-test",
@@ -132,8 +132,8 @@ class ExpectedFileFreshnessTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             stale_runner = RingerRunner(
-                test_manifest(root / "stale"),
-                test_config(root / "stale"),
+                make_manifest(root / "stale"),
+                make_config(root / "stale"),
                 identity="freshness-test",
                 dashboard_enabled=False,
             )
@@ -154,8 +154,8 @@ class ExpectedFileFreshnessTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("stale expected files", stale_runtime.last_check_output)
 
             fresh_runner = RingerRunner(
-                test_manifest(root / "fresh"),
-                test_config(root / "fresh"),
+                make_manifest(root / "fresh"),
+                make_config(root / "fresh"),
                 identity="freshness-test",
                 dashboard_enabled=False,
             )
@@ -231,8 +231,8 @@ class UnexpectedRunnerFailureTests(unittest.IsolatedAsyncioTestCase):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
             runner = RingerRunner(
-                test_manifest(root, ("broken", "sibling")),
-                test_config(root),
+                make_manifest(root, ("broken", "sibling")),
+                make_config(root),
                 identity="lifecycle-test",
                 dashboard_enabled=False,
             )

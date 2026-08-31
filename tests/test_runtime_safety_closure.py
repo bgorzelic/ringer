@@ -76,7 +76,7 @@ def manifest_obj(
     return obj
 
 
-def test_config(root: Path, engine: EngineConfig) -> AppConfig:
+def make_config(root: Path, engine: EngineConfig) -> AppConfig:
     return AppConfig(
         path=None,
         identity_default=None,
@@ -213,7 +213,7 @@ class WorkerVerdictTests(unittest.IsolatedAsyncioTestCase):
             )
             runner = RingerRunner(
                 manifest,
-                test_config(root, engine),
+                make_config(root, engine),
                 identity="worker-verdict-test",
                 dashboard_enabled=False,
             )
@@ -279,7 +279,7 @@ class ProcessGroupCleanupTests(unittest.IsolatedAsyncioTestCase):
             )
             runner = RingerRunner(
                 manifest,
-                test_config(root, engine),
+                make_config(root, engine),
                 identity="timeout-cleanup-test",
                 dashboard_enabled=False,
             )
@@ -334,7 +334,7 @@ class ProcessGroupCleanupTests(unittest.IsolatedAsyncioTestCase):
             )
             runner = RingerRunner(
                 Manifest.from_obj(manifest_obj(root, [task_obj()])),
-                test_config(root, engine),
+                make_config(root, engine),
                 identity="global-cleanup-test",
                 dashboard_enabled=False,
             )
@@ -386,7 +386,7 @@ class ExecutableDeclarationTests(unittest.TestCase):
             )
             manifest = Manifest.from_obj(manifest_obj(root, [task_obj()]))
             with self.assertRaisesRegex(ValueError, "slash-containing relative paths"):
-                preflight_engine_bins(manifest, test_config(root, engine))
+                preflight_engine_bins(manifest, make_config(root, engine))
 
     def test_env_declaration_uses_inline_path_from_task_engine_args(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -409,7 +409,7 @@ class ExecutableDeclarationTests(unittest.TestCase):
             task["engine_args"] = [f"PATH={bin_dir}", "selected-worker"]
             manifest = Manifest.from_obj(manifest_obj(root, [task]))
 
-            preflight_engine_bins(manifest, test_config(root, engine))
+            preflight_engine_bins(manifest, make_config(root, engine))
 
     def test_env_preflight_checks_multiple_tasks_in_key_order(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -437,7 +437,7 @@ class ExecutableDeclarationTests(unittest.TestCase):
                 ValueError,
                 r"task 'a-mismatched' worker executable mismatch",
             ):
-                preflight_engine_bins(manifest, test_config(root, engine))
+                preflight_engine_bins(manifest, make_config(root, engine))
 
 
 class ContentFreshnessTests(unittest.IsolatedAsyncioTestCase):
