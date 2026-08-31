@@ -10,17 +10,47 @@
 [engines.codex]
 harness = "Codex CLI"
 access = "OAuth plan"
-default_model_key = "gpt-5.5"
+default_model_key = "gpt-5.6-sol"
+
+[engines.codex.models."codex"]
+display = "GPT-5.6 Sol"
+confidence = "verified"
+source = "Ringer run dickie-subscription-local-smoke-rerun-20260815T221342Z-20260815T222024Z-p42769"
+
+[engines.codex.models."gpt-5.6-sol"]
+display = "GPT-5.6 Sol"
+confidence = "verified"
+source = "Ringer run dickie-subscription-local-smoke-rerun-20260815T221342Z-20260815T222024Z-p42769"
+
+[engines.codex.models."gpt-5.3-codex-spark"]
+display = "GPT-5.3 Codex Spark"
+confidence = "verified"
+source = "/Users/bgorzelic/dev/audits/20260816T000319-0400-wedgie-monday-home-base-live/spark-subscription-preflight.md"
 
 [engines.codex.models."gpt-5.5"]
 display = "GPT-5.5"
 confidence = "verified"     # snapshot gpt-5.5-2026-04-23, Codex CLI default; see capability file
 source = "https://developers.openai.com/codex/models"
 
+[engines.claude]
+harness = "Claude Code"
+access = "Claude Max subscription"
+default_model_key = "sonnet"
+
+[engines.claude.models."sonnet"]
+display = "Claude Sonnet 5"
+confidence = "verified"
+source = "/Users/bgorzelic/dev/audits/20260815T161900-0400-macstudio-local-inference/optimization-results.md"
+
 [engines.grok]
 harness = "Grok Build CLI"
 access = "OAuth plan"
-default_model_key = "grok-build"
+default_model_key = "grok-4.6"
+
+[engines.grok.models."grok-4.6"]
+display = "Grok 4.6"
+confidence = "unavailable"
+source = "grok models observed 2026-08-15; CLI authentication currently absent"
 
 [engines.grok.models."grok-build"]
 # "Grok Build" is the HARNESS (the CLI product); the model behind the
@@ -57,3 +87,43 @@ source = "manifest model field; OpenRouter slug moonshotai/kimi-k2.7-code"
 display = "Nemotron 3 Super 120B (free)"
 confidence = "verified"
 source = "manifest model field; OpenRouter slug nvidia/nemotron-3-super-120b-a12b:free"
+
+[engines.kimi]
+harness = "Kimi Code"
+access = "Managed OAuth subscription"
+default_model_key = "kimi-code/kimi-for-coding"
+
+[engines.kimi.models."kimi-code/kimi-for-coding"]
+display = "Kimi for Coding"
+confidence = "verified"
+source = "kimi provider list observed managed OAuth on 2026-08-15"
+
+[engines.kimi.models."kimi-code/kimi-for-coding-highspeed"]
+display = "Kimi for Coding High Speed"
+confidence = "configured"
+source = "managed kimi-code provider model list"
+
+[engines.kimi.models."kimi-code/k3"]
+display = "Kimi K3"
+confidence = "configured"
+source = "managed kimi-code provider model list"
+
+[engines.kimi.models."kimi-code/k3-256k"]
+display = "Kimi K3 256K"
+confidence = "configured"
+source = "managed kimi-code provider model list"
+
+[engines.macstudio]
+harness = "OpenCode"
+access = "MacStudioAgentSJ local Ollama"
+default_model_key = "macstudio/qwen3-coder:30b-32k"
+
+[engines.macstudio.models."macstudio/qwen3-coder:30b-32k"]
+display = "Qwen 3 Coder 30B Local 32K"
+confidence = "verified"
+source = "/Users/bgorzelic/dev/audits/20260815T161900-0400-macstudio-local-inference/optimization-results.md"
+
+[engines.macstudio.models."macstudio/qwen3:30b-32k"]
+display = "Qwen 3 30B Local 32K"
+confidence = "verified"
+source = "/Users/bgorzelic/dev/audits/20260815T161900-0400-macstudio-local-inference/model-audit.md"

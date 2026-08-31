@@ -560,7 +560,7 @@ class TaskSpec:
             raise ValueError(f"task {key}: engine_args must be a list of strings")
         verified = obj.get("verified", "")
         if not isinstance(verified, str):
-            raise ValueError(f"task {key}: verified must be a string (plain-English description of what the check proves)")
+            raise ValueError(f"task {key}: verified must be a string (clear description of what the check proves)")
         model = obj.get("model", "")
         if not isinstance(model, str):
             raise ValueError(f"task {key}: model must be a string (e.g. 'openrouter/z-ai/glm-5.2')")
@@ -736,7 +736,7 @@ def lint_manifest(manifest: Manifest, *, include_model_log_nudges: bool = False)
         if not task.verified:
             findings.append(
                 f"{task.key}: no 'verified' description; a reader of the results page sees "
-                "'checked' but not what the check proves — add one plain-English sentence."
+                "'checked' but not what the check proves — add one clear sentence."
             )
         if include_model_log_nudges and not task.task_type:
             findings.append(
@@ -3651,7 +3651,7 @@ def render_work_group(
     else:
         items_html = '<p class="empty-note">Waiting its turn.</p>'
 
-    # Close the trust loop where the results live: say in plain English what
+    # Close the trust loop where the results live: say in clear, accessible language what
     # the check proved, and keep the raw evidence one click away. The proof
     # stands on its own — a failed task shows why it failed even when no
     # 'verified' sentence was written.
@@ -7851,6 +7851,23 @@ class RingerRunner:
     ) -> None:
         engine = self.config.engines.get(runtime.task.engine)
         resolved_model = runtime.task.model or (engine.model_default if engine else "")
+        # An empty `model` is not the same fact as "the model was not recorded".
+        # Half of the historical runs.jsonl rows carry model="" with no way to
+        # tell which case they were, which is what makes route attribution
+        # unreconstructable after the fact. Record the provenance alongside.
+        if runtime.task.model:
+            model_source = "task"
+        elif engine is None:
+            model_source = "engine_unknown"
+        elif engine.model_default:
+            model_source = "engine_default"
+        else:
+            model_source = "engine_no_default"
+        # task_token_accounting() already decomposes known/unknown/pending
+        # attempts; only the collapsed `tokens` value was reaching the log, so a
+        # single unreported attempt discarded an otherwise-real total. Emit the
+        # decomposition too -- additive, existing readers keep working.
+        token_acct = task_token_accounting(runtime)
         notes_parts = [
             f"retry={'true' if retrying else 'false'}",
             f"worker_returncode={worker.returncode}",
@@ -7883,6 +7900,15 @@ class RingerRunner:
                 "notes": "\n".join(notes_parts),
                 "orchestrator": self.identity,
                 "model": resolved_model,
+                "model_source": model_source,
+                "route_observed_engine": runtime.task.engine,
+                "route_observed_model": resolved_model,
+                "worker_tokens_known_total": token_acct["tokens_known_total"],
+                "worker_tokens_exact": token_acct["tokens_exact"],
+                "worker_tokens_partial": token_acct["tokens_partial"],
+                "worker_token_attempts": token_acct["token_attempts"],
+                "worker_token_known_attempts": token_acct["token_known_attempts"],
+                "worker_token_unknown_attempts": token_acct["token_unknown_attempts"],
                 "task_type": runtime.task.task_type,
                 "retry": retrying,
             }
