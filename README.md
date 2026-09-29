@@ -392,6 +392,8 @@ Four rules are baked into every worker invocation. They all cost us real debuggi
 
 Every community PR that lands in main is credited here — that's a project rule, enforced by a test. Thank you:
 
+- [@heyjawrsh](https://github.com/heyjawrsh) — the scoreboard resolves and shows a per-task cost, an unrecorded value reads as unrecorded rather than zero, and the models tab shows the same column the CLI does (#141 carries the ports)
+- [@dudarenok-maker](https://github.com/dudarenok-maker) — the model-identity registry corrections taken wholesale, current model-id registrations, real-registry test coverage, and the fix that stops scoring runs whose worker never started (#141 carries the ports)
 - [@bgorzelic](https://github.com/bgorzelic) (Brian Gorzelic) — stopped the test suite from writing its fixtures into the live scoreboard database (#141)
 - [@Fiddlehead-MB](https://github.com/Fiddlehead-MB) (Melinda Byerley) — exact-byte demo checks, explicit newline instructions, and regression coverage (#101)
 - [@oceanonline](https://github.com/oceanonline) — portable `python3` in template checks + lint quickstart path fix (#24)
