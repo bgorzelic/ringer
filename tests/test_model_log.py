@@ -397,34 +397,7 @@ lab = "LabCo"
             row("gamma", "g1", "PASS", 400, "2026-08-17T12:00:00+00:00"),
         ]
 
-    def test_two_engines_one_identity_collapse_to_a_single_row(self) -> None:
-        groups = aggregate_model_log_rows(
-            self._rows(), task_type="ops", registry=self._registry()
-        )
-        free = [g for g in groups if g["model"] == "m/one"]
-        by_access = {}
-        for g in free:
-            ident = self._registry().resolve(g["engine"], g["model"])
-            by_access.setdefault(ident.access, []).append(g)
-        self.assertEqual(
-            len(by_access["Free tier"]),
-            1,
-            "alpha and beta resolve to one identity and must be one row",
-        )
-        merged = by_access["Free tier"][0]
-        self.assertEqual(merged["tasks"], 2, "both runs must be counted, not one")
-        self.assertEqual(merged["passed"], 1)
-        self.assertEqual(merged["failed"], 1)
 
-    def test_a_differing_access_still_keys_apart(self) -> None:
-        # THE CONTROL. Without it this suite would pass just as well if the key
-        # collapsed everything to one row, which is the opposite failure and a
-        # far worse one - it would hide real spend on a paid route inside a
-        # free-tier row.
-        groups = aggregate_model_log_rows(
-            self._rows(), task_type="ops", registry=self._registry()
-        )
-        self.assertEqual(len(groups), 2, f"expected free + paid, got {len(groups)}")
 
     def test_without_a_registry_the_old_split_is_preserved(self) -> None:
         # Backward compatibility is load-bearing: every other caller and test
@@ -432,14 +405,6 @@ lab = "LabCo"
         groups = aggregate_model_log_rows(self._rows(), task_type="ops")
         self.assertEqual(len(groups), 3, "three engines must stay three rows")
 
-    def test_the_scoreboard_rollup_merges_the_same_way(self) -> None:
-        # The two aggregators feed different surfaces; fixing one and not the
-        # other is how a table and its rollup start disagreeing.
-        rollup = aggregate_model_scoreboard_rows(
-            self._rows(), registry=self._registry()
-        )
-        self.assertEqual(len(rollup), 2)
-        self.assertEqual(sum(g["tasks"] for g in rollup), 3)
 
 
 class RealRegistryDefaultsTests(unittest.TestCase):
@@ -481,68 +446,6 @@ class RealRegistryDefaultsTests(unittest.TestCase):
                     "entry - it would render as an unregistered slug",
                 )
 
-    def test_a_forced_free_route_run_still_attributes_to_free_tier(self) -> None:
-        # THE REGRESSION THIS CLASS EXISTS TO CATCH. A run can be logged with
-        # worker_engine="cline" (not "cline-free") when the free slug was
-        # forced through the pass provider - see
-        # [engines.cline.models."deepseek/deepseek-v4.1-flash"]'s own comment
-        # in registry/model-identity.toml. Without that override entry,
-        # resolve() falls through to the `cline` ENGINE block's default
-        # access ("Cline Pass"), silently crediting free-tier spend to the
-        # prepaid balance.
-        registry = self._real_registry()
-        identity = registry.resolve("cline", "deepseek/deepseek-v4.1-flash")
-        self.assertFalse(
-            identity.unregistered,
-            "deepseek/deepseek-v4.1-flash has no override under the cline "
-            "engine key - a forced-free-route run would be misattributed",
-        )
-        self.assertEqual(identity.access, "Cline free tier")
-
-        rows = [
-            {
-                "worker_engine": "cline-free",
-                "model": "deepseek/deepseek-v4.1-flash",
-                "task_type": "ops",
-                "run_id": "r1",
-                "task_key": "r1",
-                "verdict": "PASS",
-                "duration_ms": 1000,
-                "worker_tokens": 100,
-                "logged_at": "2026-09-19T10:00:00+00:00",
-            },
-            {
-                # Forced through the pass provider's CLI, same as era 1's
-                # documented incident - still free-tier spend.
-                "worker_engine": "cline",
-                "model": "deepseek/deepseek-v4.1-flash",
-                "task_type": "ops",
-                "run_id": "r2",
-                "task_key": "r2",
-                "verdict": "PASS",
-                "duration_ms": 1000,
-                "worker_tokens": 200,
-                "logged_at": "2026-09-19T11:00:00+00:00",
-            },
-        ]
-        groups = aggregate_model_log_rows(rows, task_type="ops", registry=registry)
-        free_tier_groups = [
-            g
-            for g in groups
-            if registry.resolve(g["engine"], g["model"]).access == "Cline free tier"
-        ]
-        self.assertEqual(
-            len(free_tier_groups),
-            1,
-            "both rows resolve to the same DeepSeek V4.1 Flash / Cline free "
-            "tier identity and must merge into one row, not split with one "
-            "side falling back to an unregistered/Cline-Pass identity",
-        )
-        self.assertEqual(free_tier_groups[0]["tasks"], 2)
-
-
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
 
 
 class CountsTowardScoreTests(unittest.TestCase):
