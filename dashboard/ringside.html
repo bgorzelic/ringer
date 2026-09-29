@@ -726,8 +726,15 @@
       return `${secs}s`;
     }
 
+    function recordedNumber(value) {
+      if (value == null || value === "") return null;
+      const n = Number(value);
+      return Number.isFinite(n) ? n : null;
+    }
+
     function formatTokens(value) {
-      return `${Math.round(numberOrZero(value)).toLocaleString()} tok`;
+      const n = recordedNumber(value);
+      return n == null ? "—" : `${Math.round(n).toLocaleString()} tok`;
     }
 
     function relativeAgo(value) {
